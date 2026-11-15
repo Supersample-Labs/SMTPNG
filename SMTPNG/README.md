@@ -1,10 +1,10 @@
 # SMTPNG — SMTP capture and optional relay
 
-SMTPNG accepts SMTP email and logs subjects, envelope senders and recipients. Capture-only is the default. Optional forwarding sends a copy through an upstream SMTP server. Incoming STARTTLS and upstream STARTTLS are configured separately.
+SMTPNG accepts SMTP email and logs subjects, envelope senders and recipients. Capture-only is the default. Optional relay sends mail through an upstream SMTP server or directly to recipient MX servers, with optional DKIM signing. Incoming STARTTLS and upstream STARTTLS are configured separately.
 
 ## Installation and opening the GUI
 
-Extract the whole ZIP and run `SMTPNG.exe`. Requires the .NET 10 Windows Desktop Runtime. SMTPNG 1.4 targets `net10.0-windows`; building from source requires the .NET 10 SDK or newer.
+Extract the whole ZIP and run `SMTPNG.exe`. The self-contained Windows x64 release includes the .NET runtime; no separate runtime installation is needed. Framework-dependent builds require the .NET 10 Windows Desktop Runtime. SMTPNG 1.5 targets `net10.0-windows`; building from source requires the .NET 10 SDK or newer.
 
 To install: stop the GUI listener, configure settings, open **Forwarding and Windows service**, and click **Install service**. Approve Windows administrator elevation. Files are copied from the folder containing the executable you launched into:
 
@@ -111,7 +111,37 @@ In **Forwarding and Windows service**, click **Enable forwarding**, enter the up
 
 In **Relay access**, enter one sending-system IP or CIDR per line. Mix IPv4/IPv6 addresses and subnets, e.g. `192.168.1.50`, `10.20.0.0/16`, `2001:db8::/32`. The preview shows effective networks and invalid rules. Host bits are normalized: `192.168.1.25/24` allows `192.168.1.0/24`. Semicolons/commas are accepted too. Defaults permit only `127.0.0.1` and `::1`. Other clients receive SMTP 550 in forwarding mode. Capture-only does not use the relay allowlist; the incoming TLS requirement applies to both modes.
 
-When `.eml` saving is enabled, a local message file is saved before forwarding; otherwise no message file is saved. **Forwarded** means the upstream accepted DATA, not guaranteed inbox delivery. Upstream failures are logged and return SMTP 451 for the original sender to retry. No background retry queue is provided. A timeout around upstream acceptance can produce duplicates when the sender retries. This is an upstream/smarthost relay, not a direct-to-MX server; no DKIM signing, bounce generation or mailbox hosting is provided.
+When `.eml` saving is enabled, a local message file is saved before forwarding; otherwise no message file is saved. **Forwarded** means the upstream accepted DATA, not guaranteed inbox delivery. Upstream failures are logged and return SMTP 451 for the original sender to retry. No background retry queue is provided. A timeout around upstream acceptance can produce duplicates when the sender retries. No background queue, bounce generation or mailbox hosting is provided.
+
+## Direct delivery and DKIM
+
+In **Forwarding and Windows service**, select **Deliver directly to recipient MX** instead of upstream forwarding, and enter your public SMTP hostname in **Public EHLO hostname**. Relay access rules apply in either mode. Capture-only remains the default. Direct mode ignores upstream host, port and credentials.
+
+SMTPNG resolves each recipient domain's MX records using the system DNS resolvers, tries lower-preference values first and falls back to the recipient domain's address when there are no MX records. A null MX rejects delivery. Delivery uses outbound TCP port 25, with STARTTLS when advertised and normal certificate validation. Failed TLS is never retried in plaintext on that host. Direct mode does not implement MTA-STS or DANE.
+
+Your network/provider must permit outbound TCP 25. Configure a public hostname with matching forward/reverse DNS and SPF authorization for your sending IP, and configure DMARC for your domain. Recipient policies and IP reputation can still cause rejection; acceptance by an MX does not guarantee inbox placement.
+
+To enable DKIM (in either relay mode):
+
+1. Enter your sending domain (for example `example.com`) and a selector (for example `smtp2026`).
+2. Click **Generate DKIM key**. SMTPNG creates a 2048-bit RSA key and displays the TXT record name and value. Publish that single TXT record in DNS. The displayed zone-file format splits the long value into quoted chunks belonging to the same record.
+3. Enable **DKIM signing**, then save GUI settings or apply settings to the stopped service, and restart it. The same saved key is used for signing. DNS publication/propagation is your responsibility; SMTPNG does not verify it automatically.
+
+The private key uses machine-scope Windows DPAPI, like upstream credentials. Keep settings private and retain a protected backup on the same machine. Signing requires exactly one From mailbox matching the configured domain; other From domains fail delivery. Messages are converted to a 7-bit MIME transport before RSA-SHA256 signing with relaxed canonicalization. Captures and saved `.eml` files retain the original incoming message; the outgoing copy carries the signature. Capture-only mode does not sign.
+
+For key rotation use a new selector, generate a new key, publish the new record and apply the settings. Retain the old selector's DNS record while previously sent mail may still be verified. Replacing a key under the same selector requires coordinated DNS propagation.
+
+Delivery is synchronous. Failures return SMTP 451 and are logged; the sending client must retry. With multiple destinations, some may accept before another fails. Retrying the whole message can deliver duplicates to those recipients, as can a lost final DATA response. There is no persistent retry queue or per-recipient retry tracking.
+
+## DMARC setup helper
+
+Open **DMARC setup** and enter the domain in the visible From address. Choose `none` (monitoring), `quarantine` or `reject`, an optional aggregate reporting mailbox, and relaxed (`r`) or strict (`s`) DKIM/SPF alignment. The helper displays the TXT name `_dmarc.yourdomain` and value to publish. Publish only one DMARC record at that name. Save GUI settings to retain the helper choices; apply to service settings if you want those choices retained there as well. The helper does not change delivery or publish DNS.
+
+Start with monitoring and review all legitimate sending systems before publishing an enforcement policy. Reports go to the supplied mailbox/report service; SMTPNG does not host that mailbox or process reports. External reporting services may require authorization DNS records from the provider.
+
+**Check published DNS and DKIM alignment** checks the exact domain's DMARC TXT record, compares the policy with the form, checks exact DKIM/From-domain alignment and compares the published DKIM public key with the configured private key. It uses system DNS resolvers without a local application cache; DNS propagation and resolver caching still apply. Results use a snapshot of the fields when clicked; recheck after changing them.
+
+This is a setup check, not receiver-side DMARC verification. It does not evaluate SPF, inherited/organizational-domain policy, relaxed alignment between different domains, external reporting authorization, every DMARC extension, or actual message signatures at a receiver. A matching DKIM domain/key alone does not establish DMARC pass. Send a test message and inspect receiver Authentication-Results. See the [DMARC specification](https://www.rfc-editor.org/rfc/rfc9989.html).
 
 ## Test commands
 
@@ -145,7 +175,7 @@ Send-MailMessage -SmtpServer 'smtp.example.com' -Port 25 -UseSsl -From 'sender@e
 ```powershell
 dotnet build -c Release
 dotnet publish -c Release -o publish
-dotnet run --project ..\SMTPNG.Smoke\Smoke.csproj -c Release
+dotnet run --project ..\SMTPNG.Tests\SMTPNG.Tests.csproj -c Release
 ```
 
-Tests use local ports 2524–2527 and temporary test certificates/keys without adding trusted certificates or modifying certificate stores. They cover capture, SMTP sequencing, forwarding, CIDR rules, password protection, STARTTLS handshakes, required TLS, encrypted capture, renewal on the same running listener, expiry/missing-certificate handling, settings persistence, enabled/disabled .eml saving, adjacent Emails folders, daily log rollover, 30-day retention boundaries, legacy migration and concurrent metadata writes. Actual service installation and a real win-acme renewal require verification on your deployment machine.
+The included tests exercise DKIM verification after serialization, tamper detection, DNS key consistency, signing-domain enforcement, mode validation, configured EHLO, and direct SMTP transport against a local ephemeral port. Real-world DNS/MX delivery, GUI interaction and Windows service installation require deployment verification.

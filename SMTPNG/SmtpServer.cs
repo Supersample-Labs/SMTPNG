@@ -64,7 +64,7 @@ public sealed class SmtpServer
         cancellation = new CancellationTokenSource();
         _ = AcceptAsync(next, cancellation.Token);
         retentionTimer = new System.Threading.Timer(_ => MaintainLogs(), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
-        WriteLog($"Listening on {address}:{port}. Forwarding {(settings.Forwarding ? "enabled" : "disabled")}.");
+        WriteLog($"Listening on {address}:{port}. Forwarding {(settings.RelayEnabled ? "enabled" : "disabled")}.");
     }
 
     public void Stop()
@@ -160,13 +160,18 @@ public sealed class SmtpServer
                         case "MAIL":
                             if (!greeted) { await Reply("503 Send EHLO first"); break; }
                             if (settings.RequireIncomingTls && !secure) { await Reply("530 STARTTLS is required before MAIL FROM"); break; }
-                            if (settings.Forwarding && !relayNetworks.Any(x => x.Contains(remoteIp)))
+                            if (settings.RelayEnabled && !relayNetworks.Any(x => x.Contains(remoteIp)))
                             { await Reply("550 Client IP is not allowed to relay"); break; }
                             if (!TryAddress(argument, "FROM:", out var from)) { await Reply("501 Expected MAIL FROM:<address>"); break; }
                             sender = from; recipients.Clear(); await Reply("250 Sender accepted"); break;
                         case "RCPT":
                             if (sender is null) { await Reply("503 Send MAIL FROM first"); break; }
                             if (!TryAddress(argument, "TO:", out var to) || to.Length == 0) { await Reply("501 Expected RCPT TO:<address>"); break; }
+                            if (settings.DirectDelivery)
+                            {
+                                try { DirectDelivery.Domain(to); }
+                                catch (ArgumentException) { await Reply("501 Direct delivery requires a valid recipient domain"); break; }
+                            }
                             recipients.Add(to); await Reply("250 Recipient accepted"); break;
                         case "DATA":
                             if (sender is null || recipients.Count == 0) { await Reply("503 Send MAIL FROM and RCPT TO first"); break; }
@@ -193,12 +198,12 @@ public sealed class SmtpServer
                                 {
                                     if (settings.SaveEml) await File.WriteAllTextAsync(file, raw, Encoding.Latin1, token);
                                     var delivery = "Captured";
-                                    if (settings.Forwarding)
+                                    if (settings.RelayEnabled)
                                     {
                                         try
                                         {
                                             await SmtpForwarder.SendAsync(settings, sender, recipients, raw, token);
-                                            delivery = "Forwarded";
+                                            delivery = settings.DirectDelivery ? "Delivered to MX" : "Forwarded";
                                         }
                                         catch (Exception ex) when (ex is not OutOfMemoryException)
                                         {
@@ -212,7 +217,7 @@ public sealed class SmtpServer
                                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { WriteLog($"Metadata log failed: {ex.Message}"); }
                                     WriteLog($"{delivery}: From=<{sender}> To={mail.To} Subject={mail.Subject}");
                                     Received?.Invoke(mail);
-                                    await Reply(delivery == "Forward failed" ? "451 Upstream delivery failed; retry later" : "250 Message " + delivery.ToLowerInvariant());
+                                    await Reply(delivery == "Forward failed" ? "451 Delivery failed; retry later" : "250 Message " + delivery.ToLowerInvariant());
                                 }
                                 catch (IOException ex) { WriteLog($"Capture failed: {ex.Message}"); await Reply("451 Unable to save message"); }
                                 catch (UnauthorizedAccessException ex) { WriteLog($"Capture failed: {ex.Message}"); await Reply("451 Unable to save message"); }

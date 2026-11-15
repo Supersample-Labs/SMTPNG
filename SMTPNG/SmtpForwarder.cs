@@ -9,11 +9,18 @@ internal static class SmtpForwarder
 {
     public static async Task SendAsync(AppSettings settings, string sender, IReadOnlyList<string> recipients, string raw, CancellationToken cancellation)
     {
+        if (settings.DkimEnabled) raw = DkimSigning.Sign(settings, raw);
+        if (settings.DirectDelivery) await DirectDelivery.SendAsync(settings, sender, recipients, raw, cancellation);
+        else await SendToHostAsync(settings, settings.UpstreamHost, settings.UpstreamPort, sender, recipients, raw, cancellation);
+    }
+
+    internal static async Task SendToHostAsync(AppSettings settings, string host, int port, string sender, IReadOnlyList<string> recipients, string raw, CancellationToken cancellation, bool direct = false)
+    {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         timeout.CancelAfter(TimeSpan.FromSeconds(60));
         var token = timeout.Token;
         using var client = new TcpClient();
-        await client.ConnectAsync(settings.UpstreamHost, settings.UpstreamPort, token);
+        await client.ConnectAsync(host, port, token);
         // Reject loops to this listener, including hostname aliases and all-interface binds.
         var endpoint = (IPEndPoint)client.Client.RemoteEndPoint!;
         var local = (IPEndPoint)client.Client.LocalEndPoint!;
@@ -45,19 +52,19 @@ internal static class SmtpForwarder
         {
             CreateReaders();
             await Response(220);
-            var hello = await Command("EHLO dummy-smtp.local", 250);
-            if (settings.StartTls)
+            var hello = await Command("EHLO " + (settings.HeloHostname.Length > 0 ? settings.HeloHostname : "dummy-smtp.local"), 250);
+            if (direct ? hello.Contains("STARTTLS", StringComparison.OrdinalIgnoreCase) : settings.StartTls)
             {
                 if (!hello.Contains("STARTTLS", StringComparison.OrdinalIgnoreCase)) throw new IOException("Upstream does not offer STARTTLS.");
                 await Command("STARTTLS", 220);
                 reader!.Dispose(); writer!.Dispose();
                 var tls = new SslStream(stream, false);
                 stream = tls;
-                await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions { TargetHost = settings.UpstreamHost }, token);
+                await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions { TargetHost = host }, token);
                 CreateReaders();
-                await Command("EHLO dummy-smtp.local", 250);
+                await Command("EHLO " + (settings.HeloHostname.Length > 0 ? settings.HeloHostname : "dummy-smtp.local"), 250);
             }
-            if (settings.Username.Length > 0)
+            if (!direct && settings.Username.Length > 0)
             {
                 await Command("AUTH LOGIN", 334);
                 await Command(Convert.ToBase64String(Encoding.UTF8.GetBytes(settings.Username)), 334);

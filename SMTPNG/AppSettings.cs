@@ -9,6 +9,19 @@ public sealed record AppSettings
 {
     public string BindAddress { get; init; } = "0.0.0.0";
     public int Port { get; init; } = 25;
+    public string DmarcDomain { get; init; } = "";
+    public string DmarcPolicy { get; init; } = "none";
+    public string DmarcReportAddress { get; init; } = "";
+    public string DmarcDkimAlignment { get; init; } = "r";
+    public string DmarcSpfAlignment { get; init; } = "r";
+    public bool DirectDelivery { get; init; }
+    public string HeloHostname { get; init; } = "";
+    public bool DkimEnabled { get; init; }
+    public string DkimDomain { get; init; } = "";
+    public string DkimSelector { get; init; } = "smtp";
+    public string ProtectedDkimKey { get; init; } = "";
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool RelayEnabled => Forwarding || DirectDelivery;
     public bool Forwarding { get; init; }
     public string UpstreamHost { get; init; } = "";
     public int UpstreamPort { get; init; } = 587;
@@ -53,6 +66,11 @@ public sealed record AppSettings
         if (RequireIncomingTls && !IncomingStartTls) throw new ArgumentException("Enable incoming STARTTLS before requiring TLS.");
         if (IncomingStartTls && (string.IsNullOrWhiteSpace(CertificateFriendlyName) || CertificateStore is not ("My" or "WebHosting")))
             throw new ArgumentException("Select Local Computer My or WebHosting store and enter a certificate friendly name.");
+        if (DkimEnabled) DkimSigning.Validate(this);
+        if (DirectDelivery && Forwarding) throw new ArgumentException("Choose either upstream forwarding or direct delivery.");
+        if ((DirectDelivery || HeloHostname.Length > 0) && (Uri.CheckHostName(HeloHostname) != UriHostNameType.Dns || !HeloHostname.Contains('.') || HeloHostname.Any(char.IsWhiteSpace)))
+            throw new ArgumentException("Direct delivery requires your public SMTP hostname (for EHLO).");
+        if (RelayEnabled && allowed.Length == 0) throw new ArgumentException("Add an allowed relay IP or subnet.");
         if (!Forwarding) return;
         if (string.IsNullOrWhiteSpace(UpstreamHost) || UpstreamHost.Any(char.IsWhiteSpace)) throw new ArgumentException("Enter an upstream SMTP hostname.");
         if (allowed.Length == 0) throw new ArgumentException("Add at least one allowed relay IP address or CIDR subnet on the Relay access tab.");

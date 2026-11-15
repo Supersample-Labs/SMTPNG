@@ -20,6 +20,18 @@ public sealed class MainForm : Form
     private readonly TextBox detail = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Font = new Font("Consolas", 10) };
     private readonly TextBox activity = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
     private readonly CheckBox forwarding = new() { Text = "Enable forwarding", Appearance = Appearance.Button, AutoSize = true };
+    private readonly CheckBox direct = new() { Text = "Deliver directly to recipient MX", AutoSize = true };
+    private readonly TextBox helo = new() { Width = 270 };
+    private readonly CheckBox dkim = new() { Text = "Enable DKIM signing", AutoSize = true };
+    private readonly TextBox dkimDomain = new() { Width = 270 };
+    private readonly TextBox dkimSelector = new() { Width = 140, Text = "smtp" };
+    private readonly TextBox dkimDns = new() { Width = 700, Height = 150, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both };
+    private readonly TextBox dmarcDomain = new() { Width = 300 };
+    private readonly ComboBox dmarcPolicy = new() { Width = 160, DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly TextBox dmarcReport = new() { Width = 350 };
+    private readonly ComboBox dmarcDkimAlignment = new() { Width = 80, DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly ComboBox dmarcSpfAlignment = new() { Width = 80, DropDownStyle = ComboBoxStyle.DropDownList };
+    private string protectedDkimKey = "";
     private readonly TextBox host = new() { Width = 270 };
     private readonly NumericUpDown upstreamPort = new() { Minimum = 1, Maximum = 65535, Value = 587, Width = 85 };
     private readonly CheckBox tls = new() { Text = "Require STARTTLS", Checked = true, AutoSize = true };
@@ -65,7 +77,30 @@ public sealed class MainForm : Form
             row.Controls.AddRange(controls); settingsPanel.Controls.Add(row);
         }
         var save = new Button { Text = "Save GUI settings", AutoSize = true };
-        Row("Mode", forwarding, save);
+        Row("Mode", forwarding, direct, save);
+        Row("Public EHLO hostname", helo);
+        Row("DKIM", dkim);
+        Row("DKIM domain / selector", dkimDomain, dkimSelector);
+        var generateDkim = new Button { Text = "Generate DKIM key", AutoSize = true };
+        Row("Signing key", generateDkim);
+        Row("DNS record to publish", dkimDns);
+        void RefreshDkimDns()
+        {
+            try { dkimDns.Text = protectedDkimKey.Length == 0 ? "Generate a key to see the DNS TXT record." : DkimSigning.DnsRecord(protectedDkimKey, dkimDomain.Text.Trim(), dkimSelector.Text.Trim()); }
+            catch (Exception ex) { dkimDns.Text = ex.Message; }
+        }
+        generateDkim.Click += (_, _) =>
+        {
+            if (protectedDkimKey.Length > 0 && MessageBox.Show(this, "Replace the existing signing key? Publish the new DNS record before enabling signing.", "Rotate DKIM key", MessageBoxButtons.YesNo) != DialogResult.Yes) return;
+            using var rsa = System.Security.Cryptography.RSA.Create(2048);
+            protectedDkimKey = Secret.Protect(rsa.ExportRSAPrivateKeyPem());
+            RefreshDkimDns();
+        };
+        dkimDomain.TextChanged += (_, _) => RefreshDkimDns();
+        dkimSelector.TextChanged += (_, _) => RefreshDkimDns();
+        direct.CheckedChanged += (_, _) => { if (direct.Checked) forwarding.Checked = false; };
+        forwarding.CheckedChanged += (_, _) => { if (forwarding.Checked) direct.Checked = false; };
+        settingsPanel.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(850, 0), Text = "Publish the DKIM TXT record before enabling signing. Save/apply settings to retain the generated key. Direct delivery uses outbound TCP 25 and recipient MX records; no upstream credentials are used." });
         Row("Message files", saveEml, new Label { AutoSize = true, Text = "Daily logs retained for 30 days", Padding = new Padding(0, 5, 0, 0) });
         Row("GUI emails folder", new TextBox { ReadOnly = true, Width = 520, Text = AppSettings.EmailDirectory });
         Row("Service emails folder", new TextBox { ReadOnly = true, Width = 520, Text = Path.Combine(AppSettings.InstallDirectory, "Emails") });
@@ -73,7 +108,7 @@ public sealed class MainForm : Form
         Row("Upstream SMTP", host, upstreamPort, tls);
         Row("Upstream username", username);
         Row("Upstream password", password);
-        settingsPanel.Controls.Add(new Label { Text = "Manage allowed IP addresses and CIDR subnets on the Relay access tab. Forwarding uses an upstream SMTP server.", AutoSize = true });
+        settingsPanel.Controls.Add(new Label { Text = "Manage allowed IP addresses and CIDR subnets on the Relay access tab. Choose upstream forwarding or direct delivery.", AutoSize = true });
         var install = new Button { Text = "Install service", AutoSize = true };
         var apply = new Button { Text = "Apply settings to service", AutoSize = true };
         var load = new Button { Text = "Load service settings", AutoSize = true };
@@ -89,7 +124,7 @@ public sealed class MainForm : Form
         var accessTab = new TabPage("Relay access");
         var accessLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(12) };
         accessLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize)); accessLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); accessLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        accessLayout.Controls.Add(new Label { AutoSize = true, Dock = DockStyle.Fill, Text = "Allowed relay clients — enter one IP address or CIDR subnet per line.\r\nExamples: 192.168.1.50   •   10.20.0.0/16   •   2001:db8::/32\r\nRules apply when forwarding is enabled. Stop the listener before editing; save/apply in Forwarding and Windows service.", Padding = new Padding(0, 0, 0, 10) }, 0, 0);
+        accessLayout.Controls.Add(new Label { AutoSize = true, Dock = DockStyle.Fill, Text = "Allowed relay clients — enter one IP address or CIDR subnet per line.\r\nExamples: 192.168.1.50   •   10.20.0.0/16   •   2001:db8::/32\r\nRules apply to upstream and direct relay. Stop the listener before editing; save/apply in Forwarding and Windows service.", Padding = new Padding(0, 0, 0, 10) }, 0, 0);
         var accessSplit = new SplitContainer { Dock = DockStyle.Fill, Size = new Size(900, 350), SplitterDistance = 350 };
         accessSplit.Panel1.Controls.Add(allowed);
         var preview = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false, RowHeadersVisible = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill, BackgroundColor = SystemColors.Window };
@@ -148,11 +183,56 @@ public sealed class MainForm : Form
             }
             catch (Exception ex) { certResult.Text = ex.Message; }
         };
-        tabs.TabPages.AddRange(new[] { rawTab, activityTab, settingsTab, accessTab, tlsTab });
+        var dmarcTab = new TabPage("DMARC setup");
+        var dmarcPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(12) };
+        dmarcTab.Controls.Add(dmarcPanel);
+        void DmarcRow(string label, params Control[] controls)
+        {
+            var row = new FlowLayoutPanel { AutoSize = true, WrapContents = true, MaximumSize = new Size(850, 0) };
+            row.Controls.Add(new Label { Text = label, AutoSize = true, Width = 200, Padding = new Padding(0, 5, 0, 0) });
+            row.Controls.AddRange(controls); dmarcPanel.Controls.Add(row);
+        }
+        dmarcPolicy.Items.AddRange(new object[] { "none", "quarantine", "reject" }); dmarcPolicy.SelectedIndex = 0;
+        foreach (var combo in new[] { dmarcDkimAlignment, dmarcSpfAlignment }) { combo.Items.AddRange(new object[] { "r", "s" }); combo.SelectedIndex = 0; }
+        dmarcPanel.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(850, 0), Text = "Publish DMARC in your domain's DNS. Start with none (monitoring); review reports and all authorized senders before using quarantine or reject. This policy affects all mail using the domain, including mail sent outside SMTPNG." });
+        DmarcRow("Visible From domain", dmarcDomain);
+        DmarcRow("Failure policy", dmarcPolicy);
+        DmarcRow("Aggregate report email (optional)", dmarcReport);
+        DmarcRow("DKIM / SPF alignment", dmarcDkimAlignment, dmarcSpfAlignment);
+        dmarcPanel.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(850, 0), Text = "r = relaxed; s = strict. Use an existing mailbox or report service for reports; SMTPNG does not receive or analyze them. External reporting destinations may require a DNS authorization record from that provider." });
+        var dmarcRecord = new TextBox { Width = 800, Height = 90, ReadOnly = true, Multiline = true, ScrollBars = ScrollBars.Both };
+        DmarcRow("DNS TXT record to publish", dmarcRecord);
+        void RefreshDmarc()
+        {
+            try { dmarcRecord.Text = "Name: _dmarc." + DmarcSetup.Domain(dmarcDomain.Text) + "\r\nType: TXT\r\nValue: " + DmarcSetup.Record(dmarcDomain.Text, dmarcPolicy.Text, dmarcReport.Text.Trim(), dmarcDkimAlignment.Text, dmarcSpfAlignment.Text); }
+            catch (ArgumentException ex) { dmarcRecord.Text = ex.Message; }
+        }
+        foreach (var control in new Control[] { dmarcDomain, dmarcPolicy, dmarcReport, dmarcDkimAlignment, dmarcSpfAlignment }) control.TextChanged += (_, _) => RefreshDmarc();
+        var checkDmarc = new Button { Text = "Check published DNS and DKIM alignment", AutoSize = true };
+        var saveDmarc = new Button { Text = "Save GUI settings", AutoSize = true };
+        DmarcRow("", checkDmarc, saveDmarc);
+        var dmarcResult = new TextBox { Width = 800, Height = 190, ReadOnly = true, Multiline = true, ScrollBars = ScrollBars.Vertical };
+        DmarcRow("Check results", dmarcResult);
+        saveDmarc.Click += async (_, _) => { try { if (await SaveGuiSettings(ReadSettings())) dmarcResult.Text = "GUI settings saved. DNS must be published separately."; } catch (Exception ex) { MessageBox.Show(this, ex.Message); } };
+        checkDmarc.Click += async (_, _) =>
+        {
+            checkDmarc.Enabled = false; dmarcResult.Text = "Checking DNS...";
+            try
+            {
+                var snapshot = new AppSettings { DmarcDomain = dmarcDomain.Text.Trim(), DmarcPolicy = dmarcPolicy.Text, DmarcReportAddress = dmarcReport.Text.Trim(), DmarcDkimAlignment = dmarcDkimAlignment.Text, DmarcSpfAlignment = dmarcSpfAlignment.Text, DkimEnabled = dkim.Checked, DkimDomain = dkimDomain.Text.Trim(), DkimSelector = dkimSelector.Text.Trim(), ProtectedDkimKey = protectedDkimKey };
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+                var result = await DmarcSetup.CheckAsync(snapshot, timeout.Token);
+                if (!IsDisposed) dmarcResult.Text = result;
+            }
+            catch (Exception ex) { if (!IsDisposed) dmarcResult.Text = ex is OperationCanceledException ? "DNS check timed out. Try again." : ex.Message; }
+            finally { if (!IsDisposed) checkDmarc.Enabled = true; }
+        };
+        RefreshDmarc();
+        tabs.TabPages.AddRange(new[] { rawTab, activityTab, settingsTab, dmarcTab, accessTab, tlsTab });
         var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 300 };
         split.Panel1.Controls.Add(grid); split.Panel2.Controls.Add(tabs);
         tabs.SelectedIndexChanged += (_, _) => split.Panel1Collapsed = tabs.SelectedTab == settingsTab || tabs.SelectedTab == accessTab || tabs.SelectedTab == tlsTab;
-        var note = new Label { Dock = DockStyle.Bottom, Height = 44, Text = "Capture only by default • Optional incoming STARTTLS • Optional upstream forwarding with relay IP/subnet rules", Padding = new Padding(8) };
+        var note = new Label { Dock = DockStyle.Bottom, Height = 44, Text = "Capture only by default • Optional incoming STARTTLS • Optional upstream or direct delivery and DKIM with relay IP/subnet rules", Padding = new Padding(8) };
         Controls.Add(split); Controls.Add(toolbar); Controls.Add(note);
         foreach (var (property, label, weight) in new[] { ("Received", "Received", 18f), ("From", "From (envelope)", 22f), ("To", "To (envelope)", 28f), ("Subject", "Subject", 35f), ("Remote", "Client", 18f), ("Delivery", "Delivery", 16f) })
             grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = property, HeaderText = label, FillWeight = weight });
@@ -187,7 +267,7 @@ public sealed class MainForm : Form
                     status.Text = $"Listening • {messages.Count} in view";
                 });
                 viewService.Checked = false;
-                server.Start(ip, (int)port.Value); start.Enabled = false; stop.Enabled = true; bind.Enabled = port.Enabled = false; settingsPanel.Enabled = false; allowed.Enabled = false; tlsPanel.Enabled = false; status.Text = settings.Forwarding ? "Listening / forwarding" : "Listening / capture";
+                server.Start(ip, (int)port.Value); start.Enabled = false; stop.Enabled = true; bind.Enabled = port.Enabled = false; settingsPanel.Enabled = false; allowed.Enabled = false; tlsPanel.Enabled = false; status.Text = settings.RelayEnabled ? "Listening / relay" : "Listening / capture";
             }
             catch (Exception ex) { MessageBox.Show(this, $"Cannot start listener: {ex.Message}\n\nCheck whether another program is using this port.", "SMTP listener", MessageBoxButtons.OK, MessageBoxIcon.Error); }
         };
@@ -251,7 +331,7 @@ public sealed class MainForm : Form
 
     private AppSettings ReadSettings()
     {
-        var settings = new AppSettings { BindAddress = bind.Text.Trim(), Port = (int)port.Value, Forwarding = forwarding.Checked, UpstreamHost = host.Text.Trim(), UpstreamPort = (int)upstreamPort.Value, StartTls = tls.Checked, Username = username.Text, ProtectedPassword = Secret.Protect(password.Text), AllowedClients = string.Join(";", RelayAccess.Entries(allowed.Text)), IncomingStartTls = incomingTls.Checked, RequireIncomingTls = requireTls.Checked, CertificateStore = certStore.Text, CertificateFriendlyName = certName.Text.Trim(), SaveEml = saveEml.Checked };
+        var settings = new AppSettings { BindAddress = bind.Text.Trim(), Port = (int)port.Value, Forwarding = forwarding.Checked, DirectDelivery = direct.Checked, HeloHostname = helo.Text.Trim(), DkimEnabled = dkim.Checked, DkimDomain = dkimDomain.Text.Trim(), DkimSelector = dkimSelector.Text.Trim(), ProtectedDkimKey = protectedDkimKey, UpstreamHost = host.Text.Trim(), UpstreamPort = (int)upstreamPort.Value, StartTls = tls.Checked, Username = username.Text, ProtectedPassword = Secret.Protect(password.Text), AllowedClients = string.Join(";", RelayAccess.Entries(allowed.Text)), IncomingStartTls = incomingTls.Checked, RequireIncomingTls = requireTls.Checked, CertificateStore = certStore.Text, CertificateFriendlyName = certName.Text.Trim(), SaveEml = saveEml.Checked, DmarcDomain = dmarcDomain.Text.Trim(), DmarcPolicy = dmarcPolicy.Text, DmarcReportAddress = dmarcReport.Text.Trim(), DmarcDkimAlignment = dmarcDkimAlignment.Text, DmarcSpfAlignment = dmarcSpfAlignment.Text };
         settings.Validate(); return settings;
     }
 
@@ -262,6 +342,12 @@ public sealed class MainForm : Form
         username.Text = settings.Username; password.Text = Secret.Unprotect(settings.ProtectedPassword); allowed.Text = string.Join(Environment.NewLine, RelayAccess.Entries(settings.AllowedClients));
         incomingTls.Checked = settings.IncomingStartTls; requireTls.Checked = settings.RequireIncomingTls; certStore.SelectedItem = settings.CertificateStore; certName.Text = settings.CertificateFriendlyName;
         saveEml.Checked = settings.SaveEml;
+        dmarcDomain.Text = settings.DmarcDomain; dmarcPolicy.SelectedItem = settings.DmarcPolicy; dmarcReport.Text = settings.DmarcReportAddress;
+        dmarcDkimAlignment.SelectedItem = settings.DmarcDkimAlignment; dmarcSpfAlignment.SelectedItem = settings.DmarcSpfAlignment;
+        direct.Checked = settings.DirectDelivery; helo.Text = settings.HeloHostname;
+        protectedDkimKey = settings.ProtectedDkimKey; dkim.Checked = settings.DkimEnabled;
+        dkimDomain.Text = settings.DkimDomain; dkimSelector.Text = settings.DkimSelector;
+        dkimDns.Text = protectedDkimKey.Length == 0 ? "Generate a key to see the DNS TXT record." : DkimSigning.DnsRecord(protectedDkimKey, settings.DkimDomain, settings.DkimSelector);
     }
 
     private async Task<bool> SaveGuiSettings(AppSettings settings)
