@@ -9,6 +9,15 @@ public sealed record AppSettings
 {
     public string BindAddress { get; init; } = "0.0.0.0";
     public int Port { get; init; } = 25;
+    public int DeliveryWorkers { get; init; } = 4;
+    public int ConnectionsPerDestination { get; init; } = 2;
+    public int MaxIncomingConnections { get; init; } = 32;
+    public int MaxQueueMessages { get; init; } = 10000;
+    public int MaxQueueMegabytes { get; init; } = 1024;
+    public int MinimumFreeDiskMegabytes { get; init; } = 256;
+    public int RetryMinutes { get; init; } = 30;
+    public int RetryDays { get; init; } = 5;
+    public bool NotifyDeliveryFailures { get; init; } = true;
     public string DmarcDomain { get; init; } = "";
     public string DmarcPolicy { get; init; } = "none";
     public string DmarcReportAddress { get; init; } = "";
@@ -62,6 +71,8 @@ public sealed record AppSettings
     {
         if (!System.Net.IPAddress.TryParse(BindAddress, out _)) throw new ArgumentException("Enter a valid bind IP.");
         if (Port is < 1 or > 65535 || UpstreamPort is < 1 or > 65535) throw new ArgumentException("Invalid port.");
+        if (DeliveryWorkers is < 1 or > 32 || ConnectionsPerDestination is < 1 or > 16 || MaxIncomingConnections is < 1 or > 256 || MaxQueueMessages is < 1 or > 1000000 || MaxQueueMegabytes is < 1 or > 1048576 || MinimumFreeDiskMegabytes is < 0 or > 1048576 || RetryMinutes is < 1 or > 1440 || RetryDays is < 1 or > 30)
+            throw new ArgumentException("Invalid queue limits, worker count or retry settings.");
         var allowed = RelayAccess.Parse(AllowedClients);
         if (RequireIncomingTls && !IncomingStartTls) throw new ArgumentException("Enable incoming STARTTLS before requiring TLS.");
         if (IncomingStartTls && (string.IsNullOrWhiteSpace(CertificateFriendlyName) || CertificateStore is not ("My" or "WebHosting")))

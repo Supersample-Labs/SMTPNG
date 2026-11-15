@@ -4,7 +4,7 @@ SMTPNG accepts SMTP email and logs subjects, envelope senders and recipients. Ca
 
 ## Installation and opening the GUI
 
-Extract the whole ZIP and run `SMTPNG.exe`. The self-contained Windows x64 release includes the .NET runtime; no separate runtime installation is needed. Framework-dependent builds require the .NET 10 Windows Desktop Runtime. SMTPNG 1.5 targets `net10.0-windows`; building from source requires the .NET 10 SDK or newer.
+Extract the whole ZIP and run `SMTPNG.exe`. The self-contained Windows x64 release includes the .NET runtime; no separate runtime installation is needed. Framework-dependent builds require the .NET 10 Windows Desktop Runtime. SMTPNG 1.6 targets `net10.0-windows`; building from source requires the .NET 10 SDK or newer.
 
 To install: stop the GUI listener, configure settings, open **Forwarding and Windows service**, and click **Install service**. Approve Windows administrator elevation. Files are copied from the folder containing the executable you launched into:
 
@@ -70,7 +70,7 @@ Portable GUI:         <folder containing SMTPNG.exe>\Emails
 
 **Open saved emails** opens the appropriate GUI/service email folder. Installation/apply creates the installed Emails subfolder and gives the installing/configuring Windows user Modify access to that subfolder only; SYSTEM/Administrators retain their normal access. Other users may need permission to save there or may run the GUI as administrator. SMTPNG checks directory write access before starting when saving is enabled.
 
-With saving disabled, message metadata and forwarding status are still logged, and forwarding works normally. The GUI listener can show raw content while it remains in memory, but the service cannot show unsaved content later. Failed forwards also produce no `.eml` unless saving is enabled. The metadata saved-file path is empty when no file was saved.
+With saving disabled, message metadata and forwarding status are still logged, and forwarding works normally. The capture grid retains bounded raw previews; the service can show saved captures. Relay queue bodies are stored independently of .eml saving and are available in Delivery queue until every recipient is delivered. Failed queue bodies remain available for inspection/export. The metadata saved-file path is empty when no file was saved.
 
 The 30-day log retention policy **does not delete `.eml` files**. Disabling saving affects future messages and does not remove existing emails. Older `.eml` files in previous capture folders are left in place; they are not moved automatically. Manage saved emails separately as needed.
 
@@ -111,7 +111,7 @@ In **Forwarding and Windows service**, click **Enable forwarding**, enter the up
 
 In **Relay access**, enter one sending-system IP or CIDR per line. Mix IPv4/IPv6 addresses and subnets, e.g. `192.168.1.50`, `10.20.0.0/16`, `2001:db8::/32`. The preview shows effective networks and invalid rules. Host bits are normalized: `192.168.1.25/24` allows `192.168.1.0/24`. Semicolons/commas are accepted too. Defaults permit only `127.0.0.1` and `::1`. Other clients receive SMTP 550 in forwarding mode. Capture-only does not use the relay allowlist; the incoming TLS requirement applies to both modes.
 
-When `.eml` saving is enabled, a local message file is saved before forwarding; otherwise no message file is saved. **Forwarded** means the upstream accepted DATA, not guaranteed inbox delivery. Upstream failures are logged and return SMTP 451 for the original sender to retry. No background retry queue is provided. A timeout around upstream acceptance can produce duplicates when the sender retries. No background queue, bounce generation or mailbox hosting is provided.
+Relay mode stores mail in a durable delivery queue before replying SMTP 250. The capture grid shows **Queued** with its queue ID; use **Delivery queue** for current per-recipient delivery state. **Delivered** means the destination accepted DATA, not guaranteed inbox delivery. Capture-only behavior remains independent of the relay queue.
 
 ## Direct delivery and DKIM
 
@@ -131,7 +131,7 @@ The private key uses machine-scope Windows DPAPI, like upstream credentials. Kee
 
 For key rotation use a new selector, generate a new key, publish the new record and apply the settings. Retain the old selector's DNS record while previously sent mail may still be verified. Replacing a key under the same selector requires coordinated DNS propagation.
 
-Delivery is synchronous. Failures return SMTP 451 and are logged; the sending client must retry. With multiple destinations, some may accept before another fails. Retrying the whole message can deliver duplicates to those recipients, as can a lost final DATA response. There is no persistent retry queue or per-recipient retry tracking.
+Delivery happens in the background after durable acceptance, with per-recipient retries. See the queue section below. SMTP has an unavoidable ambiguity if the final acceptance response is lost, or a process exits after remote acceptance but before recording it locally; retry can produce a duplicate. Per-recipient tracking avoids resending recipients whose success was recorded.
 
 ## DMARC setup helper
 
@@ -142,6 +142,43 @@ Start with monitoring and review all legitimate sending systems before publishin
 **Check published DNS and DKIM alignment** checks the exact domain's DMARC TXT record, compares the policy with the form, checks exact DKIM/From-domain alignment and compares the published DKIM public key with the configured private key. It uses system DNS resolvers without a local application cache; DNS propagation and resolver caching still apply. Results use a snapshot of the fields when clicked; recheck after changing them.
 
 This is a setup check, not receiver-side DMARC verification. It does not evaluate SPF, inherited/organizational-domain policy, relaxed alignment between different domains, external reporting authorization, every DMARC extension, or actual message signatures at a receiver. A matching DKIM domain/key alone does not establish DMARC pass. Send a test message and inspect receiver Authentication-Results. See the [DMARC specification](https://www.rfc-editor.org/rfc/rfc9989.html).
+
+## Persistent delivery queue and overload handling
+
+Relay modes always queue mail. SQLite stores the outgoing message, recipient states, and a snapshot of the route settings in one transaction using WAL and `synchronous=FULL`. SMTPNG returns **250 Queued** only after commit. If admission fails (queue limit, disk reserve, database write failure, or signing error), it returns **451** and the submitting system must retry. Excess incoming connections get **421**. Capture-only does not create a delivery queue.
+
+Queue locations:
+
+- GUI: `%LOCALAPPDATA%\DummySmtp\Messages\Queue`
+- Service: `%PROGRAMDATA%\DummySmtp\Messages\Queue`
+
+Queue bodies are independent of optional saved `.eml` files and are stored even when .eml saving is off. They contain the outgoing, potentially DKIM-signed message. Settings snapshots contain encrypted credentials/keys and are kept private; the service queue is restricted to Administrators and SYSTEM. The GUI and service queues are independent. Upgrading or reinstalling does not remove either queue. Changing relay mode/host/key affects newly queued mail; already accepted jobs keep their original route and signed content. Keep queues on a reliable local disk; WAL databases are not suitable for network shares. Back up after stopping the listener/service, including any remaining `queue.db-wal` and `queue.db-shm` files with the database. Do not copy a live `queue.db` alone.
+
+Default settings in **Forwarding and Windows service**:
+
+| Setting | Default |
+| --- | --- |
+| Delivery workers | 4 |
+| Concurrent deliveries per destination | 2 |
+| Incoming connections | 32 |
+| Stored messages with bodies | 10,000 |
+| Total stored body size | 1,024 MiB |
+| Minimum free disk reserve | 256 MiB |
+| Initial retry delay | 30 minutes |
+| Retry lifetime | 5 days |
+| Delivery failure notices | Enabled |
+
+The byte limit measures stored message bodies, not database indexes, WAL, metadata, saved captures, or other files; keep additional disk headroom. Up to 1,000 extra small notice messages / 16 MiB are reserved for failure notices. If that reserve or disk space is exhausted, notice generation waits and logs alerts. Failed notices remain visible. The per-destination limit groups direct delivery by recipient domain, and upstream delivery by configured host/port; different domains may share the same MX. Increase limits only after testing the deployment.
+
+Temporary failures (SMTP 4xx, network/TLS/authentication problems) retry with exponential backoff, capped at one day, until the retry lifetime expires. SMTP 5xx during message delivery, null MX and nonexistent recipient domains become permanent failures. Authentication/configuration failures are retried so operators can restore the original destination; jobs retain their saved credentials. Each worker reuses a healthy upstream SMTP connection for up to 100 transactions or a 30-second idle interval. Direct MX connections are closed after each attempt. Each recipient is delivered in a separate transaction so successes can be committed independently. Workers bound memory; incoming/outgoing SMTP lines are limited to 64 KiB, recipient lists to 1,000, message data to 25 MiB, and GUI body previews to 64 KiB with an aggregate capture preview budget of about 4 Mi characters.
+
+**Delivery queue** shows pending/retrying, sending, failed and delivered recipients, attempt counts, next retry time in UTC and last errors. The list shows up to 500 recipients, prioritizing failures. **Inspect message** previews the stored content; **Export queued .eml** exports the complete stored message while its body is retained. **Retry selected recipient** resets only that failed/retrying recipient, not successful recipients. **Pause delivery** prevents new attempts while allowing in-flight transactions to finish; SMTP admission continues subject to capacity. Pause persists through restarts. **Resume delivery** re-enables workers. Select **View service captures** to manage the service queue; queue operations use the app's administrator-elevation flow. Service queue refresh is manual; the active GUI queue refreshes automatically.
+
+When all recipients succeed, the body and saved routing secrets are released. Delivered metadata remains for 30 days. Failed messages are retained indefinitely for inspection and manual retry, so they continue to count against capacity. Logs and queue failures are not silently deleted. Activity logs, a red queue status and tray warnings identify failed/stalled queues and low disk space; service alerts are visible in the GUI when viewing service captures. These are local alerts, not external email/SMS monitoring. If queue state persistence fails, delivery workers stop taking new jobs and new mail receives 451; resolve the storage fault and restart to recover interrupted recipients. A crash/interruption does not delete accepted mail.
+
+Permanent failures and exhausted retries generate a queued multipart delivery-status report to the original envelope sender when notices are enabled. Notices use an empty envelope sender and are suppressed for empty original reverse paths, automatic messages and delivery reports to avoid loops. They include the failed recipient and diagnostic, not the original message body. Only trusted submitting clients should be on the relay allowlist. Failed notices are retained for operator review. A manual retry does not send a second notice for the same failure. SMTPNG does not host mailboxes or guarantee that the original sender can receive a notice.
+
+Durable storage depends on the disk and OS honoring flush requests. Protect the queue disk with backups and, where appropriate, a UPS. No SMTP relay can guarantee exactly-once delivery when an acceptance reply is lost; see [SMTP reliability and retry rules](https://www.rfc-editor.org/rfc/rfc5321.html#section-6.1).
 
 ## Test commands
 
@@ -166,7 +203,7 @@ Send-MailMessage -SmtpServer 'smtp.example.com' -Port 25 -UseSsl -From 'sender@e
 * **TLS client rejects the certificate:** check DNS hostname/SAN, expiry, chain/intermediates, and client trust. Friendly name does not replace DNS validation.
 * **Certificate changed but old one is still used:** inspect both store and friendly name, NotBefore/expiry, private-key permissions, and the logged handshake thumbprint.
 * **SMTP 550:** add the actual source IP or subnet in Relay access, then apply settings and restart the listener/service.
-* **SMTP 451:** check today's activity log and upstream connectivity/TLS/credentials. A message file exists only if .eml saving was enabled and the save succeeded.
+* **SMTP 451:** the relay did not accept the new message; inspect queue limits, disk reserve, signing configuration and activity logs. The sending system must retry. Once accepted, SMTPNG owns retries; inspect Delivery queue for downstream errors.
 * **Settings access denied:** accept elevation when prompted; installed settings require administrator rights.
 * **Remove service:** stop it, wait for Stopped, then choose Uninstall service. Captures, settings and installed files are retained.
 
@@ -178,4 +215,4 @@ dotnet publish -c Release -o publish
 dotnet run --project ..\SMTPNG.Tests\SMTPNG.Tests.csproj -c Release
 ```
 
-The included tests exercise DKIM verification after serialization, tamper detection, DNS key consistency, signing-domain enforcement, mode validation, configured EHLO, and direct SMTP transport against a local ephemeral port. Real-world DNS/MX delivery, GUI interaction and Windows service installation require deployment verification.
+The included tests exercise DKIM verification after serialization, tamper detection, DNS key consistency, signing-domain enforcement, mode validation, configured EHLO, and direct SMTP transport against a local ephemeral port. Queue tests also exercise atomic admission, restart recovery after unclean process exit, per-recipient retry/retention, backoff and expiry, capacity/disk rejection, worker concurrency, failure notices and bounce suppression, SMTP 421/451 overload responses, reusable upstream connections, shutdown safety and service dependency copying. Real-world DNS/MX delivery and Windows service installation still require deployment verification.

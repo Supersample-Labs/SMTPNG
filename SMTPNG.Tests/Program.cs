@@ -8,6 +8,14 @@ using System.Text;
 using System.Net;
 using System.Net.Sockets;
 
+if (args is ["--queue-abrupt-exit", var crashDirectory])
+{
+    var crashStore = new QueueStore(crashDirectory);
+    crashStore.Enqueue("sender@example.com", new[] { "recipient@example.net" }, "From: sender@example.com\r\nSubject: Crash recovery\r\n\r\nDurable message\r\n", new AppSettings { Forwarding = true, UpstreamHost = "localhost", MinimumFreeDiskMegabytes = 0, NotifyDeliveryFailures = false });
+    crashStore.Claim(1);
+    Environment.Exit(0); // Simulates termination without disposing the queue or recording the delivery result.
+}
+
 static void Check(bool value, string label) { if (!value) throw new Exception(label); Console.WriteLine("PASS " + label); }
 using var rsa = RSA.Create(2048);
 var settings = new AppSettings { DirectDelivery = true, HeloHostname = "smtp.example.com", DkimEnabled = true, DkimDomain = "example.com", DkimSelector = "smtp", ProtectedDkimKey = Secret.Protect(rsa.ExportRSAPrivateKeyPem()) };
@@ -64,6 +72,7 @@ Check(mismatch.Contains("alignment is not confirmed"), "Different domains never 
 var json = System.Text.Json.JsonSerializer.Serialize(dmarcSettings with { DmarcReportAddress = "reports@example.com", DmarcPolicy = "quarantine" });
 var restored = System.Text.Json.JsonSerializer.Deserialize<AppSettings>(json)!;
 Check(restored.DmarcReportAddress == "reports@example.com" && restored.DmarcPolicy == "quarantine", "DMARC settings persist");
+await QueueTests.RunAsync(Check);
 Console.WriteLine("All checks passed.");
 
 sealed class KeyLocator(byte[] publicKey) : IDkimPublicKeyLocator

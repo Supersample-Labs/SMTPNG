@@ -98,6 +98,19 @@ internal static class WindowsService
 
     public static void Manage(string action, string configPath)
     {
+        if (action.StartsWith("queue-", StringComparison.Ordinal))
+        {
+            var directory = Path.Combine(AppSettings.ServiceRoot, "Messages", "Queue");
+            if (!File.Exists(Path.Combine(directory, "queue.db"))) throw new IOException("The service queue has not been created yet.");
+            var request = System.Text.Json.JsonSerializer.Deserialize<QueueRequest>(File.ReadAllText(configPath))!;
+            using var queue = new QueueStore(directory, owner: false);
+            if (action == "queue-retry") queue.Retry(request.RecipientId);
+            else if (action == "queue-pause") queue.SetPaused(true);
+            else if (action == "queue-resume") queue.SetPaused(false);
+            else if (action is not ("queue-list" or "queue-read")) throw new ArgumentException("Unknown queue operation.");
+            File.WriteAllText(configPath, System.Text.Json.JsonSerializer.Serialize(new QueueActionResult(queue.Overview(), queue.Paused, action == "queue-read" ? queue.ReadBody(request.RecipientId) : null)));
+            return;
+        }
         if (action == "load")
         {
             var path = File.Exists(AppSettings.ServiceConfig) ? AppSettings.ServiceConfig : AppSettings.LegacyServiceConfig;
@@ -124,14 +137,14 @@ internal static class WindowsService
                     var names = new[] { "SMTPNG.exe", "SMTPNG.dll", "SMTPNG.deps.json", "SMTPNG.runtimeconfig.json" };
                     foreach (var name in names)
                         if (!File.Exists(Path.Combine(AppContext.BaseDirectory, name))) throw new IOException($"Required application file is missing: {name}. Extract the complete ZIP first.");
-                    foreach (var name in names) File.Copy(Path.Combine(AppContext.BaseDirectory, name), Path.Combine(destination, name), true);
+                    CopyApplicationFiles(AppContext.BaseDirectory, destination);
                 }
                 SaveServiceSettings(settings);
                 SaveProtectedConfig(settings, Path.Combine(destination, "gui-settings.json"));
                 CreateEmailDirectory(destination);
                 InstallationFiles.Write(destination);
                 Sc("create", Name, "binPath=", $"\"{Path.Combine(destination, "SMTPNG.exe")}\" --service", "start=", "auto", "DisplayName=", "SMTPNG");
-                Sc("description", Name, "Captures SMTP mail locally and optionally forwards to a configured upstream SMTP server.");
+                Sc("description", Name, "Captures SMTP mail and reliably queues upstream or direct SMTP delivery.");
             }
             else
             {
@@ -149,6 +162,20 @@ internal static class WindowsService
         else throw new ArgumentException("Unknown service action.");
     }
 
+    internal static void CopyApplicationFiles(string source, string destination)
+    {
+        // Copy dependencies and self-contained runtime files, never mutable user data or settings.
+        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
+        {
+            var relative = Path.GetRelativePath(source, file);
+            if (relative.Split(Path.DirectorySeparatorChar).Any(p => p is "Emails" or "Queue" or "artifacts" or "bin" or "obj" or ".git")) continue;
+            var name = Path.GetFileName(file);
+            if (!(name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) || name is "SMTPNG.deps.json" or "SMTPNG.runtimeconfig.json")) continue;
+            var target = Path.Combine(destination, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!); File.Copy(file, target, true);
+        }
+    }
+
     private static void SaveServiceSettings(AppSettings settings)
     {
         Directory.CreateDirectory(AppSettings.ServiceRoot);
@@ -160,6 +187,11 @@ internal static class WindowsService
             directoryAcl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
         directoryAcl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null), FileSystemRights.ReadAndExecute, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
         new DirectoryInfo(AppSettings.ServiceRoot).SetAccessControl(directoryAcl);
+        var queueDirectory = Directory.CreateDirectory(Path.Combine(AppSettings.ServiceRoot, "Messages", "Queue"));
+        var queueAcl = new DirectorySecurity(); queueAcl.SetAccessRuleProtection(true, false);
+        foreach (var sid in new[] { WellKnownSidType.LocalSystemSid, WellKnownSidType.BuiltinAdministratorsSid })
+            queueAcl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+        queueDirectory.SetAccessControl(queueAcl);
         SaveProtectedConfig(settings, AppSettings.ServiceConfig);
     }
 

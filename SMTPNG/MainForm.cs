@@ -9,6 +9,23 @@ namespace DummySmtp;
 
 public sealed class MainForm : Form
 {
+    private readonly NumericUpDown workerCount = QueueNumber(1, 32, 4);
+    private readonly NumericUpDown perDestination = QueueNumber(1, 16, 2);
+    private readonly NumericUpDown incomingCount = QueueNumber(1, 256, 32);
+    private readonly NumericUpDown queueCount = QueueNumber(1, 1000000, 10000);
+    private readonly NumericUpDown queueMegabytes = QueueNumber(1, 1048576, 1024);
+    private readonly NumericUpDown freeMegabytes = QueueNumber(0, 1048576, 256);
+    private readonly NumericUpDown retryMinutes = QueueNumber(1, 1440, 30);
+    private readonly NumericUpDown retryDays = QueueNumber(1, 30, 5);
+    private readonly CheckBox failureNotices = new() { Text = "Send delivery failure notices to envelope senders", Checked = true, AutoSize = true };
+    private readonly DataGridView queueGrid = new() { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true, AllowUserToAddRows = false, AllowUserToDeleteRows = false, SelectionMode = DataGridViewSelectionMode.FullRowSelect, MultiSelect = false, RowHeadersVisible = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.DisplayedCells };
+    private readonly Label queueStatus = new() { AutoSize = true, MaximumSize = new Size(950, 0) };
+    private readonly TextBox queueDetail = new() { Dock = DockStyle.Fill, ReadOnly = true, Multiline = true, ScrollBars = ScrollBars.Both, WordWrap = false };
+    private long queueRequestId;
+    private QueueActionResult? queueResult;
+    private QueueRow[] shownQueueRows = Array.Empty<QueueRow>();
+    private string lastQueueAlert = "";
+    private static NumericUpDown QueueNumber(int minimum, int maximum, int value) => new() { Minimum = minimum, Maximum = maximum, Value = value, Width = 100 };
     private SmtpServer server = new();
     private readonly BindingList<CapturedMail> messages = new();
     private readonly TextBox bind = new() { Text = "0.0.0.0", Width = 110 };
@@ -101,6 +118,12 @@ public sealed class MainForm : Form
         direct.CheckedChanged += (_, _) => { if (direct.Checked) forwarding.Checked = false; };
         forwarding.CheckedChanged += (_, _) => { if (forwarding.Checked) direct.Checked = false; };
         settingsPanel.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(850, 0), Text = "Publish the DKIM TXT record before enabling signing. Save/apply settings to retain the generated key. Direct delivery uses outbound TCP 25 and recipient MX records; no upstream credentials are used." });
+        Row("Delivery workers / per destination", workerCount, perDestination);
+        Row("Incoming connection limit", incomingCount);
+        Row("Queue message / size (MiB) limits", queueCount, queueMegabytes);
+        Row("Minimum free disk (MiB)", freeMegabytes);
+        Row("Initial retry (minutes) / lifetime (days)", retryMinutes, retryDays);
+        Row("Delivery failure notices", failureNotices);
         Row("Message files", saveEml, new Label { AutoSize = true, Text = "Daily logs retained for 30 days", Padding = new Padding(0, 5, 0, 0) });
         Row("GUI emails folder", new TextBox { ReadOnly = true, Width = 520, Text = AppSettings.EmailDirectory });
         Row("Service emails folder", new TextBox { ReadOnly = true, Width = 520, Text = Path.Combine(AppSettings.InstallDirectory, "Emails") });
@@ -228,10 +251,66 @@ public sealed class MainForm : Form
             finally { if (!IsDisposed) checkDmarc.Enabled = true; }
         };
         RefreshDmarc();
-        tabs.TabPages.AddRange(new[] { rawTab, activityTab, settingsTab, dmarcTab, accessTab, tlsTab });
+        var queueTab = new TabPage("Delivery queue");
+        var queueLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(8) };
+        queueLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize)); queueLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        queueLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 65)); queueLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 35));
+        var queueButtons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
+        var refreshQueue = new Button { Text = "Refresh queue", AutoSize = true };
+        var retryQueue = new Button { Text = "Retry selected recipient", AutoSize = true };
+        var pauseQueue = new Button { Text = "Pause delivery", AutoSize = true };
+        var resumeQueue = new Button { Text = "Resume delivery", AutoSize = true };
+        var inspectQueue = new Button { Text = "Inspect message", AutoSize = true };
+        var exportQueue = new Button { Text = "Export queued .eml", AutoSize = true };
+        queueButtons.Controls.AddRange(new Control[] { refreshQueue, retryQueue, pauseQueue, resumeQueue, inspectQueue, exportQueue });
+        queueLayout.Controls.Add(queueButtons, 0, 0); queueLayout.Controls.Add(queueStatus, 0, 1); queueLayout.Controls.Add(queueGrid, 0, 2); queueLayout.Controls.Add(queueDetail, 0, 3); queueTab.Controls.Add(queueLayout);
+        async Task QueueAction(string action, bool exportBody = false)
+        {
+            try
+            {
+                queueRequestId = (queueGrid.CurrentRow?.DataBoundItem as QueueRow)?.RecipientId ?? 0;
+                if (action is "queue-retry" or "queue-read" && queueRequestId == 0) throw new InvalidOperationException("Select a recipient first.");
+                if (viewService.Checked)
+                {
+                    if (!await ServiceAction(action)) return;
+                }
+                else
+                {
+                    var owned = server.Queue;
+                    if (owned == null && !File.Exists(Path.Combine(server.QueueDirectory, "queue.db"))) throw new IOException("No GUI relay queue yet. Enable a relay mode and start the listener.");
+                    using var inspector = owned == null ? new QueueStore(server.QueueDirectory, owner: false) : null;
+                    var store = owned ?? inspector!;
+                    if (action == "queue-retry") store.Retry(queueRequestId);
+                    if (action == "queue-pause") store.SetPaused(true);
+                    if (action == "queue-resume") store.SetPaused(false);
+                    queueResult = new(store.Overview(), store.Paused, action == "queue-read" ? store.ReadBody(queueRequestId) : null);
+                }
+                ShowQueueResult();
+                if (action == "queue-read" && queueResult?.Body is { } body)
+                {
+                    if (exportBody)
+                    {
+                        using var dialog = new SaveFileDialog { Filter = "Email|*.eml", FileName = "queued-message.eml" };
+                        if (dialog.ShowDialog(this) == DialogResult.OK) await File.WriteAllTextAsync(dialog.FileName, body, Encoding.Latin1);
+                    }
+                    else queueDetail.Text = body.Length <= 65536 ? body : body[..65536] + "\r\n[Preview truncated; export for full content]";
+                    queueResult = queueResult with { Body = null };
+                }
+            }
+            catch (Exception ex) { queueStatus.Text = "QUEUE ALERT: " + ex.Message; queueStatus.ForeColor = Color.Firebrick; }
+        }
+        refreshQueue.Click += async (_, _) => await QueueAction("queue-list");
+        retryQueue.Click += async (_, _) => await QueueAction("queue-retry");
+        pauseQueue.Click += async (_, _) => await QueueAction("queue-pause");
+        resumeQueue.Click += async (_, _) => await QueueAction("queue-resume");
+        inspectQueue.Click += async (_, _) => await QueueAction("queue-read");
+        exportQueue.Click += async (_, _) => await QueueAction("queue-read", true);
+        queueStatus.Text = "Relay mail is durably queued before acceptance. Select View service captures to manage the service queue (administrator approval). Failed messages are retained; delivered bodies are released. Showing up to 500 recipients.";
+        queueGrid.SelectionChanged += (_, _) => { if (queueGrid.CurrentRow?.DataBoundItem is QueueRow row) queueDetail.Text = $"Queue ID: {row.MessageId}\r\nRecipient: {row.Recipient}\r\nState: {row.State}\r\nAttempts: {row.Attempts}\r\nLast error: {row.LastError}"; };
+        tabs.TabPages.AddRange(new[] { rawTab, activityTab, settingsTab, queueTab, dmarcTab, accessTab, tlsTab });
         var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 300 };
         split.Panel1.Controls.Add(grid); split.Panel2.Controls.Add(tabs);
-        tabs.SelectedIndexChanged += (_, _) => split.Panel1Collapsed = tabs.SelectedTab == settingsTab || tabs.SelectedTab == accessTab || tabs.SelectedTab == tlsTab;
+        tabs.SelectedIndexChanged += (_, _) => split.Panel1Collapsed = tabs.SelectedTab == settingsTab || tabs.SelectedTab == accessTab || tabs.SelectedTab == tlsTab || tabs.SelectedTab == dmarcTab || tabs.SelectedTab == queueTab;
         var note = new Label { Dock = DockStyle.Bottom, Height = 44, Text = "Capture only by default • Optional incoming STARTTLS • Optional upstream or direct delivery and DKIM with relay IP/subnet rules", Padding = new Padding(8) };
         Controls.Add(split); Controls.Add(toolbar); Controls.Add(note);
         foreach (var (property, label, weight) in new[] { ("Received", "Received", 18f), ("From", "From (envelope)", 22f), ("To", "To (envelope)", 28f), ("Subject", "Subject", 35f), ("Remote", "Client", 18f), ("Delivery", "Delivery", 16f) })
@@ -243,7 +322,7 @@ public sealed class MainForm : Form
             if (grid.CurrentRow?.DataBoundItem is CapturedMail mail)
             {
                 string raw = mail.Raw;
-                try { if (raw.Length == 0 && File.Exists(mail.File)) raw = File.ReadAllText(mail.File); }
+                try { if (raw.Length == 0 && File.Exists(mail.File)) raw = ReadPreview(mail.File); }
                 catch (Exception ex) { raw = ex.Message; }
                 if (raw.Length == 0 && mail.File.Length == 0) raw = "Message content was not saved. Enable .eml saving to retain future message bodies.";
                 detail.Text = $"Saved: {(mail.File.Length == 0 ? "Not saved (.eml saving disabled)" : mail.File)}\r\nStatus: {mail.Delivery}\r\nEnvelope from: <{mail.From}>\r\nEnvelope to: {mail.To}\r\n\r\n{raw}";
@@ -258,12 +337,18 @@ public sealed class MainForm : Form
                 var settings = ReadSettings(); if (!await SaveGuiSettings(settings)) return;
                 if (WindowsService.State() is "Running" or "Starting") throw new InvalidOperationException("Stop the Windows service before starting the GUI listener.");
                 server = new SmtpServer(settings);
-                server.Log += value => Ui(() => { if (!viewService.Checked) Log(value); });
+                server.Log += value => Ui(() =>
+                {
+                    if (viewService.Checked) return;
+                    Log(value);
+                    if (value.StartsWith("QUEUE ALERT:", StringComparison.Ordinal)) ShowQueueAlert(value);
+                });
                 server.Received += mail => Ui(() =>
                 {
                     if (viewService.Checked) return;
                     messages.Insert(0, mail);
-                    if (messages.Count > 1000) messages.RemoveAt(messages.Count - 1);
+                    while (messages.Count > 1000 || messages.Sum(m => (long)m.Raw.Length) > 4 * 1024 * 1024)
+                        messages.RemoveAt(messages.Count - 1);
                     status.Text = $"Listening • {messages.Count} in view";
                 });
                 viewService.Checked = false;
@@ -306,8 +391,16 @@ public sealed class MainForm : Form
         startService.Click += async (_, _) => { if (!stop.Enabled && await ServiceAction("start")) viewService.Checked = true; };
         stopService.Click += async (_, _) => await ServiceAction("stop");
         remove.Click += async (_, _) => await ServiceAction("uninstall");
-        viewService.CheckedChanged += (_, _) => { messages.Clear(); activity.Clear(); indexStamp = ""; PollService(); };
-        timer.Tick += (_, _) => PollService(); timer.Start();
+        viewService.CheckedChanged += (_, _) => { messages.Clear(); activity.Clear(); queueDetail.Clear(); queueResult = null; shownQueueRows = Array.Empty<QueueRow>(); queueGrid.DataSource = null; lastQueueAlert = ""; indexStamp = ""; PollService(); };
+        timer.Tick += (_, _) =>
+        {
+            PollService();
+            if (tabs.SelectedTab == queueTab && !viewService.Checked && server.Queue is { } store)
+            {
+                try { queueResult = new(store.Overview(), store.Paused); ShowQueueResult(); }
+                catch (Exception ex) { queueStatus.Text = "QUEUE ALERT: " + ex.Message; }
+            }
+        }; timer.Start();
         try { LoadSettings(AppSettings.LoadGui()); }
         catch (UnauthorizedAccessException) { Shown += async (_, _) => await ServiceAction("load-gui"); }
         catch (Exception ex) { Log($"Settings could not be loaded: {ex.Message}"); }
@@ -329,14 +422,24 @@ public sealed class MainForm : Form
         FormClosing += (_, _) => { tray.Visible = false; tray.Dispose(); trayMenu.Dispose(); timer.Stop(); timer.Dispose(); server.Stop(); };
     }
 
+    private static string ReadPreview(string path)
+    {
+        using var reader = new StreamReader(path, Encoding.Latin1);
+        var buffer = new char[65536]; var count = reader.ReadBlock(buffer, 0, buffer.Length);
+        return new string(buffer, 0, count) + (reader.Peek() < 0 ? "" : "\r\n[Preview truncated]");
+    }
+
     private AppSettings ReadSettings()
     {
-        var settings = new AppSettings { BindAddress = bind.Text.Trim(), Port = (int)port.Value, Forwarding = forwarding.Checked, DirectDelivery = direct.Checked, HeloHostname = helo.Text.Trim(), DkimEnabled = dkim.Checked, DkimDomain = dkimDomain.Text.Trim(), DkimSelector = dkimSelector.Text.Trim(), ProtectedDkimKey = protectedDkimKey, UpstreamHost = host.Text.Trim(), UpstreamPort = (int)upstreamPort.Value, StartTls = tls.Checked, Username = username.Text, ProtectedPassword = Secret.Protect(password.Text), AllowedClients = string.Join(";", RelayAccess.Entries(allowed.Text)), IncomingStartTls = incomingTls.Checked, RequireIncomingTls = requireTls.Checked, CertificateStore = certStore.Text, CertificateFriendlyName = certName.Text.Trim(), SaveEml = saveEml.Checked, DmarcDomain = dmarcDomain.Text.Trim(), DmarcPolicy = dmarcPolicy.Text, DmarcReportAddress = dmarcReport.Text.Trim(), DmarcDkimAlignment = dmarcDkimAlignment.Text, DmarcSpfAlignment = dmarcSpfAlignment.Text };
+        var settings = new AppSettings { DeliveryWorkers = (int)workerCount.Value, ConnectionsPerDestination = (int)perDestination.Value, MaxIncomingConnections = (int)incomingCount.Value, MaxQueueMessages = (int)queueCount.Value, MaxQueueMegabytes = (int)queueMegabytes.Value, MinimumFreeDiskMegabytes = (int)freeMegabytes.Value, RetryMinutes = (int)retryMinutes.Value, RetryDays = (int)retryDays.Value, NotifyDeliveryFailures = failureNotices.Checked, BindAddress = bind.Text.Trim(), Port = (int)port.Value, Forwarding = forwarding.Checked, DirectDelivery = direct.Checked, HeloHostname = helo.Text.Trim(), DkimEnabled = dkim.Checked, DkimDomain = dkimDomain.Text.Trim(), DkimSelector = dkimSelector.Text.Trim(), ProtectedDkimKey = protectedDkimKey, UpstreamHost = host.Text.Trim(), UpstreamPort = (int)upstreamPort.Value, StartTls = tls.Checked, Username = username.Text, ProtectedPassword = Secret.Protect(password.Text), AllowedClients = string.Join(";", RelayAccess.Entries(allowed.Text)), IncomingStartTls = incomingTls.Checked, RequireIncomingTls = requireTls.Checked, CertificateStore = certStore.Text, CertificateFriendlyName = certName.Text.Trim(), SaveEml = saveEml.Checked, DmarcDomain = dmarcDomain.Text.Trim(), DmarcPolicy = dmarcPolicy.Text, DmarcReportAddress = dmarcReport.Text.Trim(), DmarcDkimAlignment = dmarcDkimAlignment.Text, DmarcSpfAlignment = dmarcSpfAlignment.Text };
         settings.Validate(); return settings;
     }
 
     private void LoadSettings(AppSettings settings)
     {
+        workerCount.Value = settings.DeliveryWorkers; perDestination.Value = settings.ConnectionsPerDestination; incomingCount.Value = settings.MaxIncomingConnections;
+        queueCount.Value = settings.MaxQueueMessages; queueMegabytes.Value = settings.MaxQueueMegabytes; freeMegabytes.Value = settings.MinimumFreeDiskMegabytes;
+        retryMinutes.Value = settings.RetryMinutes; retryDays.Value = settings.RetryDays; failureNotices.Checked = settings.NotifyDeliveryFailures;
         bind.Text = settings.BindAddress; port.Value = settings.Port; forwarding.Checked = settings.Forwarding;
         host.Text = settings.UpstreamHost; upstreamPort.Value = settings.UpstreamPort; tls.Checked = settings.StartTls;
         username.Text = settings.Username; password.Text = Secret.Unprotect(settings.ProtectedPassword); allowed.Text = string.Join(Environment.NewLine, RelayAccess.Entries(settings.AllowedClients));
@@ -364,6 +467,7 @@ public sealed class MainForm : Form
         {
             if (stop.Enabled) throw new InvalidOperationException("Stop the GUI listener first.");
             if (action is "install" or "configure" or "save-gui") ReadSettings().Save(config);
+            if (action.StartsWith("queue-", StringComparison.Ordinal)) File.WriteAllText(config, JsonSerializer.Serialize(new QueueRequest(queueRequestId)));
             var info = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = true, Verb = "runas", WindowStyle = ProcessWindowStyle.Hidden };
             info.Arguments = $"--service-action {action} \"{config}\" \"{result}\"";
             Enabled = false;
@@ -372,6 +476,7 @@ public sealed class MainForm : Form
             var outcome = File.Exists(result) ? File.ReadAllText(result) : "Service management did not return a result.";
             if (outcome != "OK") throw new InvalidOperationException(outcome);
             if (action is "load" or "load-gui") LoadSettings(AppSettings.Load(config));
+            if (action.StartsWith("queue-", StringComparison.Ordinal)) queueResult = JsonSerializer.Deserialize<QueueActionResult>(File.ReadAllText(config));
             Log($"Service action completed: {action}." );
             if (action is "install" or "configure") MessageBox.Show(this, "Service settings saved. Click Start service to begin listening.", "Windows service");
             return true;
@@ -385,6 +490,29 @@ public sealed class MainForm : Form
         }
     }
 
+    private void ShowQueueResult()
+    {
+        if (queueResult == null) return;
+        var value = queueResult.Overview;
+        var id = (queueGrid.CurrentRow?.DataBoundItem as QueueRow)?.RecipientId;
+        if (!shownQueueRows.SequenceEqual(value.Rows))
+        {
+            shownQueueRows = value.Rows;
+            queueGrid.DataSource = value.Rows;
+        }
+        foreach (DataGridViewRow row in queueGrid.Rows) if ((row.DataBoundItem as QueueRow)?.RecipientId == id) { queueGrid.CurrentCell = row.Cells[0]; break; }
+        queueStatus.Text = $"{(queueResult.Paused ? "PAUSED — " : "")}Pending/retrying: {value.Pending} | Sending: {value.Sending} | Failed: {value.Failed} | Delivered: {value.Delivered} | Stored bodies: {value.BodyBytes / 1048576.0:F1} MiB | Oldest pending (UTC): {value.OldestPendingUtc:yyyy-MM-dd HH:mm}\r\nFailed bodies are retained. Retry targets only the selected recipient. Pause stops new attempts; in-flight sends finish.";
+        queueStatus.ForeColor = value.Failed > 0 || value.OldestPendingUtc < DateTime.UtcNow.AddHours(-1) ? Color.Firebrick : SystemColors.ControlText;
+    }
+
+    private void ShowQueueAlert(string text)
+    {
+        queueStatus.Text = text; queueStatus.ForeColor = Color.Firebrick;
+        if (lastQueueAlert == text) return;
+        lastQueueAlert = text;
+        tray.ShowBalloonTip(10000, "SMTPNG delivery queue needs attention", text, ToolTipIcon.Warning);
+    }
+
     private void PollService()
     {
         serviceStatus.Text = "Service: " + WindowsService.State();
@@ -393,7 +521,12 @@ public sealed class MainForm : Form
         {
             var log = DailyLogs.Files(SelectedStorage, "activity").FirstOrDefault();
             var text = log == null ? "" : DailyLogs.Tail(log);
-            if (activity.Text != text) activity.Text = text;
+            if (activity.Text != text)
+            {
+                activity.Text = text;
+                var alert = text.Split('\n').LastOrDefault(line => line.Contains("QUEUE ALERT:", StringComparison.Ordinal));
+                if (alert != null) ShowQueueAlert(alert.Trim());
+            }
             var indexes = DailyLogs.Files(SelectedStorage, "messages");
             var stamp = string.Join("|", indexes.Select(p => p + ":" + new FileInfo(p).Length));
             if (stamp == indexStamp) return;

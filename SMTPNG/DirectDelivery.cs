@@ -11,9 +11,10 @@ internal static class DirectDelivery
     internal static async Task<string[]> ResolveAsync(string domain, CancellationToken token)
     {
         var answer = await dns.QueryAsync(domain, QueryType.MX, cancellationToken: token);
+        if (answer.Header.ResponseCode == DnsHeaderResponseCode.NotExistentDomain) throw new SmtpDeliveryException($"Recipient domain {domain} does not exist.", true);
         if (answer.HasError) throw new IOException($"MX lookup failed for {domain}: {answer.ErrorMessage}");
         var records = answer.Answers.MxRecords().ToArray();
-        if (records.Any(x => x.Exchange.Value == ".")) throw new IOException($"{domain} does not accept email (null MX).");
+        if (records.Any(x => x.Exchange.Value == ".")) throw new SmtpDeliveryException($"{domain} does not accept email (null MX).", true);
         return records.Length == 0 ? new[] { domain } : records.OrderBy(x => x.Preference).ThenBy(_ => Random.Shared.Next()).Select(x => x.Exchange.Value.TrimEnd('.')).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
@@ -34,6 +35,7 @@ internal static class DirectDelivery
                     failure = null;
                     break;
                 }
+                catch (SmtpDeliveryException ex) when (ex.Permanent) { throw; }
                 catch (Exception ex) when (!token.IsCancellationRequested && ex is IOException or System.Net.Sockets.SocketException or OperationCanceledException or System.Security.Authentication.AuthenticationException)
                 { failure = ex; }
             }

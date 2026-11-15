@@ -15,6 +15,9 @@ public sealed record CapturedMail(DateTime Received, string From, string To, str
 public sealed class SmtpServer
 {
     private TcpListener? listener;
+    private DeliveryQueue? deliveryQueue;
+    public string QueueDirectory => Path.Combine(StoragePath, "Queue");
+    internal QueueStore? Queue => deliveryQueue?.Store;
     private CancellationTokenSource? cancellation;
     private readonly ConcurrentDictionary<TcpClient, byte> clients = new();
     public event Action<CapturedMail>? Received;
@@ -59,10 +62,17 @@ public sealed class SmtpServer
         }
         MaintainLogs();
         var next = new TcpListener(address, port);
-        next.Start(100);
+        try
+        {
+            if (settings.RelayEnabled) deliveryQueue = new DeliveryQueue(QueueDirectory, settings, WriteLog);
+            next.Start(100);
+        }
+        catch { deliveryQueue?.Dispose(); deliveryQueue = null; throw; }
         listener = next;
         cancellation = new CancellationTokenSource();
-        _ = AcceptAsync(next, cancellation.Token);
+        deliveryQueue?.Start();
+        var token = cancellation.Token;
+        _ = Task.Run(() => AcceptAsync(next, token));
         retentionTimer = new System.Threading.Timer(_ => MaintainLogs(), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
         WriteLog($"Listening on {address}:{port}. Forwarding {(settings.RelayEnabled ? "enabled" : "disabled")}.");
     }
@@ -73,6 +83,7 @@ public sealed class SmtpServer
         cancellation?.Cancel();
         listener?.Stop();
         foreach (var client in clients.Keys) client.Dispose();
+        deliveryQueue?.Dispose(); deliveryQueue = null;
         cancellation?.Dispose();
         cancellation = null;
         listener = null;
@@ -80,8 +91,20 @@ public sealed class SmtpServer
 
     private void MaintainLogs()
     {
-        try { foreach (var error in logs.Maintain()) WriteLog(error); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { WriteLog($"Log maintenance failed: {ex.Message}"); }
+        try
+        {
+            foreach (var error in logs.Maintain()) WriteLog(error);
+            if (deliveryQueue != null)
+            {
+                deliveryQueue.Store.Maintain();
+                var overview = deliveryQueue.Store.Overview();
+                if (overview.Failed > 0 || overview.OldestPendingUtc < DateTime.UtcNow.AddHours(-1))
+                    WriteLog($"QUEUE ALERT: pending={overview.Pending}, sending={overview.Sending}, failed={overview.Failed}; inspect Delivery queue.");
+                if (new DriveInfo(Path.GetPathRoot(Path.GetFullPath(QueueDirectory))!).AvailableFreeSpace < settings.MinimumFreeDiskMegabytes * 1024L * 1024)
+                    WriteLog("QUEUE ALERT: low disk space; new relay mail will receive 451.");
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Microsoft.Data.Sqlite.SqliteException) { WriteLog($"Log maintenance failed: {ex.Message}"); }
     }
 
     private async Task AcceptAsync(TcpListener server, CancellationToken token)
@@ -91,6 +114,15 @@ public sealed class SmtpServer
             while (!token.IsCancellationRequested)
             {
                 var client = await server.AcceptTcpClientAsync(token);
+                if (clients.Count >= settings.MaxIncomingConnections)
+                {
+                    using (client)
+                    {
+                        try { await client.GetStream().WriteAsync(Encoding.ASCII.GetBytes("421 Server busy; retry later\r\n"), token); }
+                        catch (IOException) { }
+                    }
+                    continue;
+                }
                 clients.TryAdd(client, 0);
                 _ = HandleAsync(client, token);
             }
@@ -108,14 +140,14 @@ public sealed class SmtpServer
             using (var stream = client.GetStream())
             {
                 Stream transport = stream;
-                var reader = new StreamReader(transport, Encoding.Latin1, false, 4096, true);
+                var reader = new SmtpLineReader(transport);
                 var writer = new StreamWriter(transport, new UTF8Encoding(false), 4096, true) { NewLine = "\r\n", AutoFlush = true };
                 X509Certificate2? sessionCertificate = null;
                 bool secure = false;
                 try
                 {
                 async Task Reply(string value) => await writer.WriteLineAsync(value.AsMemory(), token);
-                async Task<string?> ReadLine() => await reader.ReadLineAsync(token).AsTask().WaitAsync(TimeSpan.FromMinutes(2), token);
+                async Task<string?> ReadLine() => await reader.ReadLineAsync(token).WaitAsync(TimeSpan.FromMinutes(2), token);
                 string? sender = null;
                 var recipients = new List<string>();
                 bool greeted = false;
@@ -153,7 +185,7 @@ public sealed class SmtpServer
                                 }, handshake.Token);
                             }
                             secure = true; greeted = false; sender = null; recipients.Clear();
-                            reader = new StreamReader(transport, Encoding.Latin1, false, 4096, true);
+                            reader = new SmtpLineReader(transport);
                             writer = new StreamWriter(transport, new UTF8Encoding(false), 4096, true) { NewLine = "\r\n", AutoFlush = true };
                             WriteLog($"TLS established with {remote}; certificate {sessionCertificate.Thumbprint}; expires {sessionCertificate.NotAfter:O}");
                             break;
@@ -172,6 +204,7 @@ public sealed class SmtpServer
                                 try { DirectDelivery.Domain(to); }
                                 catch (ArgumentException) { await Reply("501 Direct delivery requires a valid recipient domain"); break; }
                             }
+                            if (recipients.Count >= 1000) { await Reply("452 Too many recipients; send another transaction"); break; }
                             recipients.Add(to); await Reply("250 Recipient accepted"); break;
                         case "DATA":
                             if (sender is null || recipients.Count == 0) { await Reply("503 Send MAIL FROM and RCPT TO first"); break; }
@@ -202,22 +235,23 @@ public sealed class SmtpServer
                                     {
                                         try
                                         {
-                                            await SmtpForwarder.SendAsync(settings, sender, recipients, raw, token);
-                                            delivery = settings.DirectDelivery ? "Delivered to MX" : "Forwarded";
+                                            var outgoing = settings.DkimEnabled ? DkimSigning.Sign(settings, raw) : raw;
+                                            var queueId = await Task.Run(() => deliveryQueue!.Enqueue(sender, recipients, outgoing, settings), token);
+                                            delivery = "Queued " + queueId;
                                         }
                                         catch (Exception ex) when (ex is not OutOfMemoryException)
                                         {
                                             if (token.IsCancellationRequested) throw;
-                                            delivery = "Forward failed";
-                                            WriteLog($"Forward failed for message {id}: {ex.Message}");
+                                            delivery = "Queue failed";
+                                            WriteLog($"QUEUE ALERT: Queue acceptance failed for message {id}: {ex.Message}");
                                         }
                                     }
-                                    var mail = new CapturedMail(now, sender, string.Join("; ", recipients), Subject(raw), remote, raw, file, delivery);
+                                    var mail = new CapturedMail(now, sender, string.Join("; ", recipients), Subject(raw), remote, raw.Length <= 65536 ? raw : raw[..65536] + "\r\n[Preview truncated]", file, delivery);
                                     try { logs.Message(mail); }
                                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { WriteLog($"Metadata log failed: {ex.Message}"); }
                                     WriteLog($"{delivery}: From=<{sender}> To={mail.To} Subject={mail.Subject}");
                                     Received?.Invoke(mail);
-                                    await Reply(delivery == "Forward failed" ? "451 Delivery failed; retry later" : "250 Message " + delivery.ToLowerInvariant());
+                                    await Reply(delivery == "Queue failed" ? "451 Unable to queue message; retry later" : "250 Message " + delivery.ToLowerInvariant());
                                 }
                                 catch (IOException ex) { WriteLog($"Capture failed: {ex.Message}"); await Reply("451 Unable to save message"); }
                                 catch (UnauthorizedAccessException ex) { WriteLog($"Capture failed: {ex.Message}"); await Reply("451 Unable to save message"); }
@@ -245,7 +279,7 @@ public sealed class SmtpServer
         var remaining = value[prefix.Length..].TrimStart();
         if (!remaining.StartsWith('<') || remaining.IndexOf('>') is var end && end < 0) return false;
         address = remaining[1..remaining.IndexOf('>')];
-        return true;
+        return !address.Any(c => char.IsControl(c) || c is '<' or '>') && (address.Length == 0 || System.Net.Mail.MailAddress.TryCreate(address, out var parsed) && parsed.Address == address);
     }
 
     public static string Subject(string raw)
