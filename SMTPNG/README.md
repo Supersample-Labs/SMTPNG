@@ -6,7 +6,7 @@ SMTPNG accepts SMTP email and logs subjects, envelope senders and recipients. Ca
 
 Extract the whole ZIP and run `SMTPNG.exe`. The self-contained Windows x64 release includes the .NET runtime; no separate runtime installation is needed. Framework-dependent builds require the .NET 10 Windows Desktop Runtime. SMTPNG 1.6 targets `net10.0-windows`; building from source requires the .NET 10 SDK or newer.
 
-To install: stop the GUI listener, configure settings, open **Forwarding and Windows service**, and click **Install service**. Approve Windows administrator elevation. Files are copied from the folder containing the executable you launched into:
+To install: stop the GUI listener, configure settings, open **Forwarding and Windows service**, and click **Install / update service**. Approve Windows administrator elevation. Files are copied from the folder containing the executable you launched into:
 
 ```text
 C:\Program Files\SMTPNG
@@ -15,6 +15,12 @@ C:\Program Files\SMTPNG
 Installation creates this README and `Set-SMTPNGCertificateName.ps1` from resources embedded in the application; it does not depend on the source folder having a README. Click **Start service** afterward. The service starts automatically with Windows and keeps running when the GUI is closed. It runs as LocalSystem, using internal service ID `DummySmtpCapture` (retained for compatibility) and display name **SMTPNG**.
 
 To reopen the installed GUI, run `C:\Program Files\SMTPNG\SMTPNG.exe` without arguments. Select **View service captures** to see mail received by the service. Minimize hides the window to the system tray. Double-click the mail icon to reopen; right-click for Open, Start/Stop GUI listener, and Exit. Closing the GUI stops only its own listener.
+
+## Verified service installation and updates
+
+Each published build includes `SMTPNG.install-manifest.json` with a SHA-256 hash for every packaged file. The installer validates all files before copying, then copies and verifies the complete payload, including nested native libraries, runtime data and JSON files. Missing/corrupt files produce an actionable error instead of silently installing an incomplete service. Existing settings, logs, saved emails and queues are not copied over by the payload installer.
+
+Always extract the complete ZIP and run the new executable from that extracted folder. Stop the existing service and GUI listener, load service settings into the new GUI, then use **Install / update service**. This updates the stopped service in place. **Apply settings to service** does not update binaries. Afterward, click **Start service**. Do not launch the old installed GUI to update to a newer version.
 
 ## Settings are beside the installed executable
 
@@ -31,7 +37,7 @@ Installed settings files are restricted to Administrators and SYSTEM. The GUI re
 
 Stop the service, wait for **Stopped**, edit fields, click **Apply settings to service**, and then **Start service**. **Load service settings** imports the installed service configuration into the GUI fields. Certificate renewals do not require this cycle; changing TLS settings or the selected friendly name does.
 
-Older `%LOCALAPPDATA%\DummySmtp\settings.json` settings are loaded as a fallback if no GUI settings file exists. **Load service settings** can read the legacy `%PROGRAMDATA%\DummySmtp\settings.json` if the new service file is missing. Old files are retained. Save/apply to create settings at the new location. To update an older installed service, stop/uninstall it, run the new extracted GUI, load or choose your settings, and install again.
+Older `%LOCALAPPDATA%\DummySmtp\settings.json` settings are loaded as a fallback if no GUI settings file exists. **Load service settings** can read the legacy `%PROGRAMDATA%\DummySmtp\settings.json` if the new service file is missing. Old files are retained. Save/apply to create settings at the new location. To update an installed service, stop it, run the GUI from the newly extracted release, load your service settings, then click **Install / update service** and **Start service**. No uninstall is required. **Apply settings to service** changes configuration only; it does not update program files.
 
 ## Listener and capture
 
@@ -39,9 +45,9 @@ Default bind IP is `0.0.0.0`, port **25**. This listens on every IPv4 interface;
 
 The grid shows time, envelope From/To addresses, decoded subject, client and capture/forwarding status. Envelope addresses can differ from message headers. Select a message for available raw source. **Export CSV** exports the current view. **Clear view** does not delete files.
 
-GUI logs: `%LOCALAPPDATA%\DummySmtp\Messages`.
+GUI logs: `Logs` beside the executable you launched.
 
-Service logs: `%PROGRAMDATA%\DummySmtp\Messages`.
+Service logs: `C:\Program Files\SMTPNG\Logs`, including activity, message metadata and service startup errors. **Open logs** and **View service captures** use this location. Installation grants the installing user Modify permission on Logs only, not the executable directory. Logs from previous releases remain in their old AppData/ProgramData folders; they are not deleted or migrated. Queue locations remain unchanged so accepted mail is not stranded when the logging path changes.
 
 ### Daily log rotation and 30-day retention
 

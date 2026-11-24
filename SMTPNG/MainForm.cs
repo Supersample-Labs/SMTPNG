@@ -65,7 +65,7 @@ public sealed class MainForm : Form
     private readonly CheckBox viewService = new() { Text = "View service captures", AutoSize = true };
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 2000 };
     private string indexStamp = "";
-    private string SelectedStorage => viewService.Checked ? Path.Combine(AppSettings.ServiceRoot, "Messages") : server.StoragePath;
+    private string SelectedStorage => viewService.Checked ? AppSettings.ServiceLogDirectory : server.StoragePath;
 
     public MainForm()
     {
@@ -132,7 +132,7 @@ public sealed class MainForm : Form
         Row("Upstream username", username);
         Row("Upstream password", password);
         settingsPanel.Controls.Add(new Label { Text = "Manage allowed IP addresses and CIDR subnets on the Relay access tab. Choose upstream forwarding or direct delivery.", AutoSize = true });
-        var install = new Button { Text = "Install service", AutoSize = true };
+        var install = new Button { Text = "Install / update service", AutoSize = true };
         var apply = new Button { Text = "Apply settings to service", AutoSize = true };
         var load = new Button { Text = "Load service settings", AutoSize = true };
         Row("Windows service", install, apply, load);
@@ -141,6 +141,8 @@ public sealed class MainForm : Form
         var remove = new Button { Text = "Uninstall service", AutoSize = true };
         Row("Service controls", startService, stopService, remove, serviceStatus);
         Row("Logging", viewService);
+        Row("GUI logs folder", new TextBox { ReadOnly = true, Width = 520, Text = AppSettings.LogDirectory });
+        Row("Service logs folder", new TextBox { ReadOnly = true, Width = 520, Text = AppSettings.ServiceLogDirectory });
         Row("GUI settings file", new TextBox { ReadOnly = true, Width = 520, Text = AppSettings.UserConfig });
         Row("Service settings file", new TextBox { ReadOnly = true, Width = 520, Text = AppSettings.ServiceConfig });
         settingsPanel.Controls.Add(new Label { AutoSize = true, Text = "Service controls request Windows administrator approval. Stop the listener/service before switching or applying settings.\r\nInstalled service starts automatically with Windows. Closing this window leaves the service running." });
@@ -478,7 +480,7 @@ public sealed class MainForm : Form
             if (action is "load" or "load-gui") LoadSettings(AppSettings.Load(config));
             if (action.StartsWith("queue-", StringComparison.Ordinal)) queueResult = JsonSerializer.Deserialize<QueueActionResult>(File.ReadAllText(config));
             Log($"Service action completed: {action}." );
-            if (action is "install" or "configure") MessageBox.Show(this, "Service settings saved. Click Start service to begin listening.", "Windows service");
+            if (action is "install" or "configure") MessageBox.Show(this, "Service settings saved. Install / update service copies this release and its dependencies; Apply settings changes configuration only. Click Start service afterward.", "Windows service");
             return true;
         }
         catch (Exception ex) { MessageBox.Show(this, ex.Message, "Windows service", MessageBoxButtons.OK, MessageBoxIcon.Information); return false; }

@@ -123,8 +123,24 @@ internal static class QueueTests
             File.WriteAllText(Path.Combine(source, "SMTPNG.exe"), "app"); File.WriteAllText(Path.Combine(source, "Dependency.dll"), "library");
             File.WriteAllText(Path.Combine(source, "settings.json"), "private settings"); File.WriteAllText(Path.Combine(source, "queue.db"), "private queue");
             File.WriteAllText(Path.Combine(source, "runtimes", "win-x64", "native", "e_sqlite3.dll"), "native library");
+            foreach (var name in new[] { "SMTPNG.dll", "SMTPNG.deps.json", "SMTPNG.runtimeconfig.json", "runtime.dat", "runtime-extra.json" }) File.WriteAllText(Path.Combine(source, name), "payload");
+            Directory.CreateDirectory(destination);
+            File.WriteAllText(Path.Combine(destination, "settings.json"), "existing configuration");
+            InstallPayload.WriteManifest(source);
             WindowsService.CopyApplicationFiles(source, destination);
-            check(File.Exists(Path.Combine(destination, "Dependency.dll")) && File.Exists(Path.Combine(destination, "runtimes", "win-x64", "native", "e_sqlite3.dll")) && !File.Exists(Path.Combine(destination, "settings.json")) && !File.Exists(Path.Combine(destination, "queue.db")), "Service install copies runtime/dependencies without private mutable files");
+            check(File.Exists(Path.Combine(destination, "Dependency.dll")) && File.Exists(Path.Combine(destination, "runtimes", "win-x64", "native", "e_sqlite3.dll")) && File.ReadAllText(Path.Combine(destination, "settings.json")) == "existing configuration" && !File.Exists(Path.Combine(destination, "queue.db")), "Service install copies runtime/dependencies without private mutable files");
+            check(File.Exists(Path.Combine(destination, "runtime.dat")) && File.Exists(Path.Combine(destination, "runtime-extra.json")), "Service installation includes non-DLL runtime payload files");
+            File.WriteAllText(Path.Combine(source, "Dependency.dll"), "updated library"); InstallPayload.WriteManifest(source);
+            WindowsService.CopyApplicationFiles(source, destination);
+            check(File.ReadAllText(Path.Combine(destination, "Dependency.dll")) == "updated library", "Updating an existing installation replaces dependencies");
+            File.Delete(Path.Combine(source, "runtime.dat"));
+            try { WindowsService.CopyApplicationFiles(source, destination); throw new Exception("Expected incomplete payload rejection"); }
+            catch (IOException) { check(File.ReadAllText(Path.Combine(destination, "Dependency.dll")) == "updated library", "Incomplete release rejected before installed files change"); }
+            check(AppSettings.LogDirectory == Path.Combine(AppContext.BaseDirectory, "Logs") && AppSettings.ServiceLogDirectory == Path.Combine(AppSettings.InstallDirectory, "Logs"), "GUI and service logs use executable-adjacent Logs folders");
+            var defaultServer = new SmtpServer();
+            check(defaultServer.StoragePath == AppSettings.LogDirectory && defaultServer.QueueDirectory == AppSettings.GuiQueueDirectory, "Changing log location preserves existing GUI queue path");
+            var serviceServer = new SmtpServer(settings, AppSettings.ServiceLogDirectory, queueDirectory: AppSettings.ServiceQueueDirectory);
+            check(serviceServer.QueueDirectory == Path.Combine(AppSettings.ServiceRoot, "Messages", "Queue"), "Service queue path preserved independently of logs");
         }
         finally { Directory.Delete(root, true); }
     }

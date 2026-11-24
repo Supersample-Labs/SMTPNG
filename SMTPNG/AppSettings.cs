@@ -45,6 +45,10 @@ public sealed record AppSettings
     public string CertificateStore { get; init; } = "My";
     public string CertificateFriendlyName { get; init; } = "SMTPNG";
     public static string InstallDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "SMTPNG");
+    public static string LogDirectory => Path.Combine(AppContext.BaseDirectory, "Logs");
+    public static string ServiceLogDirectory => Path.Combine(InstallDirectory, "Logs");
+    public static string ServiceQueueDirectory => Path.Combine(ServiceRoot, "Messages", "Queue");
+    public static string GuiQueueDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DummySmtp", "Messages", "Queue");
     public static string ServiceRoot => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DummySmtp");
     public static string ServiceConfig => Path.Combine(InstallDirectory, "settings.json");
     public static string LegacyServiceConfig => Path.Combine(ServiceRoot, "settings.json");

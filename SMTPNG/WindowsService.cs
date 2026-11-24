@@ -44,13 +44,13 @@ internal static class WindowsService
             int error = 0;
             try
             {
-                var startupLogs = new DailyLogs(Path.Combine(AppSettings.ServiceRoot, "Messages"));
+                var startupLogs = new DailyLogs(AppSettings.ServiceLogDirectory);
                 startupLogs.ImportLegacy(Path.Combine(AppSettings.ServiceRoot, "service-error.log"), "service-error");
                 startupLogs.Maintain();
                 var config = File.Exists(AppSettings.ServiceConfig) ? AppSettings.ServiceConfig : AppSettings.LegacyServiceConfig;
                 if (!File.Exists(config)) throw new IOException("Service settings file is missing.");
                 var settings = AppSettings.Load(config);
-                server = new SmtpServer(settings, Path.Combine(AppSettings.ServiceRoot, "Messages"));
+                server = new SmtpServer(settings, AppSettings.ServiceLogDirectory, queueDirectory: AppSettings.ServiceQueueDirectory);
                 server.Start(IPAddress.Parse(settings.BindAddress), settings.Port);
                 Report(4);
                 stopped.Wait();
@@ -60,7 +60,7 @@ internal static class WindowsService
                 error = 1064;
                 try
                 {
-                    var errorLogs = new DailyLogs(Path.Combine(AppSettings.ServiceRoot, "Messages"));
+                    var errorLogs = new DailyLogs(AppSettings.ServiceLogDirectory);
                     errorLogs.ImportLegacy(Path.Combine(AppSettings.ServiceRoot, "service-error.log"), "service-error");
                     errorLogs.Maintain(); errorLogs.Error(ex.ToString());
                 }
@@ -100,7 +100,7 @@ internal static class WindowsService
     {
         if (action.StartsWith("queue-", StringComparison.Ordinal))
         {
-            var directory = Path.Combine(AppSettings.ServiceRoot, "Messages", "Queue");
+            var directory = AppSettings.ServiceQueueDirectory;
             if (!File.Exists(Path.Combine(directory, "queue.db"))) throw new IOException("The service queue has not been created yet.");
             var request = System.Text.Json.JsonSerializer.Deserialize<QueueRequest>(File.ReadAllText(configPath))!;
             using var queue = new QueueStore(directory, owner: false);
@@ -129,21 +129,15 @@ internal static class WindowsService
             if (State() is not ("Stopped" or "Not installed")) throw new InvalidOperationException("Stop the service before installing or applying settings.");
             if (action == "install")
             {
-                if (State() != "Not installed") throw new InvalidOperationException("The service is already installed.");
+                bool updating = State() == "Stopped";
                 var destination = AppSettings.InstallDirectory;
                 Directory.CreateDirectory(destination);
-                if (!Path.GetFullPath(AppContext.BaseDirectory).TrimEnd(Path.DirectorySeparatorChar).Equals(destination, StringComparison.OrdinalIgnoreCase))
-                {
-                    var names = new[] { "SMTPNG.exe", "SMTPNG.dll", "SMTPNG.deps.json", "SMTPNG.runtimeconfig.json" };
-                    foreach (var name in names)
-                        if (!File.Exists(Path.Combine(AppContext.BaseDirectory, name))) throw new IOException($"Required application file is missing: {name}. Extract the complete ZIP first.");
-                    CopyApplicationFiles(AppContext.BaseDirectory, destination);
-                }
+                CopyApplicationFiles(AppContext.BaseDirectory, destination);
                 SaveServiceSettings(settings);
                 SaveProtectedConfig(settings, Path.Combine(destination, "gui-settings.json"));
                 CreateEmailDirectory(destination);
                 InstallationFiles.Write(destination);
-                Sc("create", Name, "binPath=", $"\"{Path.Combine(destination, "SMTPNG.exe")}\" --service", "start=", "auto", "DisplayName=", "SMTPNG");
+                Sc(updating ? "config" : "create", Name, "binPath=", $"\"{Path.Combine(destination, "SMTPNG.exe")}\" --service", "start=", "auto", "DisplayName=", "SMTPNG");
                 Sc("description", Name, "Captures SMTP mail and reliably queues upstream or direct SMTP delivery.");
             }
             else
@@ -164,16 +158,7 @@ internal static class WindowsService
 
     internal static void CopyApplicationFiles(string source, string destination)
     {
-        // Copy dependencies and self-contained runtime files, never mutable user data or settings.
-        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
-        {
-            var relative = Path.GetRelativePath(source, file);
-            if (relative.Split(Path.DirectorySeparatorChar).Any(p => p is "Emails" or "Queue" or "artifacts" or "bin" or "obj" or ".git")) continue;
-            var name = Path.GetFileName(file);
-            if (!(name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) || name is "SMTPNG.deps.json" or "SMTPNG.runtimeconfig.json")) continue;
-            var target = Path.Combine(destination, relative);
-            Directory.CreateDirectory(Path.GetDirectoryName(target)!); File.Copy(file, target, true);
-        }
+        InstallPayload.Copy(source, destination);
     }
 
     private static void SaveServiceSettings(AppSettings settings)
@@ -187,12 +172,13 @@ internal static class WindowsService
             directoryAcl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
         directoryAcl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null), FileSystemRights.ReadAndExecute, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
         new DirectoryInfo(AppSettings.ServiceRoot).SetAccessControl(directoryAcl);
-        var queueDirectory = Directory.CreateDirectory(Path.Combine(AppSettings.ServiceRoot, "Messages", "Queue"));
+        var queueDirectory = Directory.CreateDirectory(AppSettings.ServiceQueueDirectory);
         var queueAcl = new DirectorySecurity(); queueAcl.SetAccessRuleProtection(true, false);
         foreach (var sid in new[] { WellKnownSidType.LocalSystemSid, WellKnownSidType.BuiltinAdministratorsSid })
             queueAcl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
         queueDirectory.SetAccessControl(queueAcl);
         SaveProtectedConfig(settings, AppSettings.ServiceConfig);
+        CreateWritableDirectory(AppSettings.ServiceLogDirectory);
     }
 
     private static void SaveProtectedConfig(AppSettings settings, string path)
@@ -209,7 +195,12 @@ internal static class WindowsService
 
     private static void CreateEmailDirectory(string installDirectory)
     {
-        var directory = Directory.CreateDirectory(Path.Combine(installDirectory, "Emails"));
+        CreateWritableDirectory(Path.Combine(installDirectory, "Emails"));
+    }
+
+    private static void CreateWritableDirectory(string path)
+    {
+        var directory = Directory.CreateDirectory(path);
         var acl = directory.GetAccessControl();
         // Only the Emails subfolder is writable by the installing user, never executable/config folders.
         var user = WindowsIdentity.GetCurrent().User ?? throw new InvalidOperationException("Cannot identify installing user.");

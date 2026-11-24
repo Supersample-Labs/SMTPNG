@@ -16,7 +16,7 @@ public sealed class SmtpServer
 {
     private TcpListener? listener;
     private DeliveryQueue? deliveryQueue;
-    public string QueueDirectory => Path.Combine(StoragePath, "Queue");
+    public string QueueDirectory { get; }
     internal QueueStore? Queue => deliveryQueue?.Store;
     private CancellationTokenSource? cancellation;
     private readonly ConcurrentDictionary<TcpClient, byte> clients = new();
@@ -29,11 +29,12 @@ public sealed class SmtpServer
     private System.Threading.Timer? retentionTimer;
     private readonly string emailDirectory;
     public string StoragePath { get; }
-    public SmtpServer(AppSettings? settings = null, string? storagePath = null, Func<X509Certificate2>? certificateProvider = null, string? emailDirectory = null)
+    public SmtpServer(AppSettings? settings = null, string? storagePath = null, Func<X509Certificate2>? certificateProvider = null, string? emailDirectory = null, string? queueDirectory = null)
     {
         this.settings = settings ?? new AppSettings();
         this.certificateProvider = certificateProvider ?? (() => CertificateSelector.Select(this.settings));
-        StoragePath = storagePath ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DummySmtp", "Messages");
+        StoragePath = storagePath ?? AppSettings.LogDirectory;
+        QueueDirectory = queueDirectory ?? (storagePath == null ? AppSettings.GuiQueueDirectory : Path.Combine(storagePath, "Queue"));
         this.emailDirectory = emailDirectory ?? AppSettings.EmailDirectory;
         logs = new DailyLogs(StoragePath);
     }

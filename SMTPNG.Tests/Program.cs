@@ -8,6 +8,13 @@ using System.Text;
 using System.Net;
 using System.Net.Sockets;
 
+if (args is ["--copy-payload", var payloadSource, var payloadDestination])
+{
+    WindowsService.CopyApplicationFiles(payloadSource, payloadDestination);
+    Console.WriteLine($"Verified {InstallPayload.Validate(payloadDestination).Count} published files in copied service payload.");
+    return;
+}
+
 if (args is ["--queue-abrupt-exit", var crashDirectory])
 {
     var crashStore = new QueueStore(crashDirectory);

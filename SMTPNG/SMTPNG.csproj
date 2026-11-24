@@ -9,7 +9,7 @@
     <RootNamespace>DummySmtp</RootNamespace>
     <Product>SMTPNG</Product>
     <Title>SMTPNG</Title>
-    <Version>1.6.0</Version>
+    <Version>1.6.1</Version>
     <ApplicationIcon>Assets\SMTPNG.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
@@ -24,4 +24,10 @@
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.5" />
     <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.13" NoWarn="NU1510" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="../LICENSE" Link="LICENSE" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="WriteInstallationManifest" AfterTargets="Publish">
+    <Exec Command="&quot;$(PublishDir)SMTPNG.exe&quot; --write-manifest &quot;$(PublishDir).&quot;" />
+  </Target>
 </Project>
